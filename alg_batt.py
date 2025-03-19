@@ -1,9 +1,9 @@
 import math
 
-#vincoli dimansioni (mm)
+#vincoli dimensioni (mm)
 diameter=18         #diametro batteria
-lenght=150          #larghezza rettangolo
-height=220          #altezza rettangolo
+lenght=200          #larghezza rettangolo
+height=50          #altezza rettangolo
 
 #vincoli tecnici
 tot_volts=11.1        #voltaggio batteria totale
