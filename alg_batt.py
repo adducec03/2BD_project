@@ -13,13 +13,19 @@ cell_amps=2.5         #amperaggio singola cella
 
 
 
-#calcolo di quante batterie ci entrano
-n_cell_x = lenght // diameter
-n_cell_y = height // diameter
-n_cell_tot = n_cell_x * n_cell_y
+#calcolo di quante celle entrano nel rettangolo
+n_cell_x = lenght // diameter       #numero celle che entrano in lunghezza
+n_cell_y = height // diameter       #numero celle che entrano in altezza
+n_celle_max = n_cell_x * n_cell_y   #numero di celle massimo che entrano nel rettngolo
 
-#calcolo di quante batterie in serie e quante in parallelo
-n_cell_s=round(tot_volts/cell_volts)
-n_cell_p=round(tot_amps/cell_amps)
-print(f"il numero massimo di celle che possono entrare in questa forma è {n_cell_tot}")
-print(f"per ottenere le specifiche richieste ti servono almeno {n_cell_s*n_cell_p} celle che devono essere collegate come {n_cell_s}S{n_cell_p}P")
+#calcolo di quante celle in serie e quante in parallelo
+n_cell_s=round(tot_volts/cell_volts)    #celle in serie
+n_cell_p=round(tot_amps/cell_amps)      #gruppi in parallelo
+n_cell_tot=n_cell_p*n_cell_s            #numero di celle necessarie
+
+print(f"il numero massimo di celle che possono entrare in questa forma è {n_celle_max}")
+print(f"per ottenere le specifiche richieste ti servono almeno {n_cell_tot} celle")
+if(n_cell_tot>n_celle_max):
+    print("la richiesta non puo essere soddisfatta perche non hai abbastanza celle")
+else:
+    print(f"le celle devono essere collegate come {n_cell_s}S{n_cell_p}P")
