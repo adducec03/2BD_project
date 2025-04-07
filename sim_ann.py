@@ -5,7 +5,7 @@ from shapely.geometry import Point, Polygon
 
 # Parametri della batteria e delle celle
 cell_diameter = 18  # Diametro della cella (mm)
-num_cells = 54  # Numero di celle
+num_cells = 40  # Numero di celle
 
 # Definisci la forma della batteria come un poligono qualsiasi (ad esempio un esagono)
 battery_shape = Polygon([(0, 0), (200, 0), (220, 50), (200, 100), (0, 100), (-20, 50)])
