@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 
 # Carica l'immagine
-img = cv2.imread("immagine.jpg")
+img = cv2.imread("photos/3.jpg")
 output = img.copy()
 
 # Converti in scala di grigi

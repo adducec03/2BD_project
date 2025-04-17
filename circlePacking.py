@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 from shapely.geometry import Polygon, Point
 from shapely import affinity
 from shapely.ops import unary_union
+import json
 
 
 def generate_hex_grid(polygon: Polygon, radius: float, angle: float = 0):
@@ -55,7 +56,7 @@ def add_extra_circles(polygon: Polygon, existing_centers: list, radius: float, s
             if not polygon.contains(buffer):
                 continue
 
-            # ⚠️ Controllo preciso: il nuovo cerchio non deve intersecare altri
+            # Controllo preciso: il nuovo cerchio non deve intersecare altri
             if all_buffers.intersects(buffer):
                 continue
 
@@ -105,15 +106,12 @@ def find_best_rotation(polygon: Polygon, radius: float, angles=None):
 
 
 if __name__ == "__main__":
-    vertices = [
-        (1, 1),    # A
-        (4, 2),    # B
-        (6, 5),    # C
-        (3.5, 4),  # D
-        (2, 6),    # E
-        (0.5, 4),  # F
-        (1, 1)     # A
-    ]
+    # Carica i punti
+    with open("polygon.json", "r") as f:
+        vertices = json.load(f)
+
+    # Separali in X e Y
+    x, y = zip(*vertices)
     poly = Polygon(vertices)
 
     circle_radius = 0.2
@@ -124,3 +122,18 @@ if __name__ == "__main__":
     # Visualizza
     plot_packing(poly, best_centers, circle_radius, title=f"Rotazione ottimale: {best_angle}°")
     print(f"Rotazione migliore: {best_angle}°, Totale cerchi: {len(best_centers)}")
+
+    # Prepara il JSON da esportare
+    export_data = {
+        "polygon": vertices,
+        "circles": [
+            {"center": [x, y], "radius": circle_radius}
+            for x, y in best_centers
+        ]
+    }
+
+    # Esporta in JSON
+    with open("polygon_with_circles.json", "w") as f:
+        json.dump(export_data, f, indent=2)
+
+    print("Risultato esportato in 'polygon_with_circles.json'")

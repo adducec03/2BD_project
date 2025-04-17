@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Visualizza Poligono e Cerchi</title>
+  <style>
+    canvas {
+      border: 1px solid black;
+      background-color: #f9f9f9;
+      display: block;
+      margin-top: 10px;
+    }
+    #log {
+      font-family: monospace;
+      white-space: pre-wrap;
+      background: #eee;
+      padding: 10px;
+    }
+  </style>
+</head>
+<body>
+  <h2>Poligono e Cerchi da JSON</h2>
+  <div id="log">Caricamento...</div>
+  <canvas id="canvas" width="800" height="800"></canvas>
+
+  <script>
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const log = document.getElementById("log");
+
+    fetch("polygon_with_circles.json")
+      .then(response => {
+        if (!response.ok) throw new Error("File JSON non trovato");
+        return response.json();
+      })
+      .then(data => {
+        log.textContent = "JSON caricato correttamente ✅";
+
+        const polygon = data.polygon;
+        const circles = data.circles;
+
+        if (!polygon || !Array.isArray(polygon)) {
+          throw new Error("Il JSON non contiene un poligono valido");
+        }
+
+        const allPoints = polygon.concat(circles.map(c => c.center));
+        const xs = allPoints.map(p => p[0]);
+        const ys = allPoints.map(p => p[1]);
+
+        const minX = Math.min(...xs);
+        const maxX = Math.max(...xs);
+        const minY = Math.min(...ys);
+        const maxY = Math.max(...ys);
+
+        const padding = 40;
+        const scale = Math.min(
+          (canvas.width - 2 * padding) / (maxX - minX || 1),
+          (canvas.height - 2 * padding) / (maxY - minY || 1)
+        );
+
+        function transform([x, y]) {
+          return [
+            padding + (x - minX) * scale,
+            canvas.height - (padding + (y - minY) * scale)
+          ];
+        }
+
+        // Disegna poligono
+        ctx.beginPath();
+        polygon.forEach((point, i) => {
+          const [x, y] = transform(point);
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        ctx.closePath();
+        ctx.strokeStyle = "black";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // Disegna cerchi
+        for (const circle of circles) {
+          const [x, y] = transform(circle.center);
+          const r = circle.radius * scale;
+
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, 2 * Math.PI);
+          ctx.fillStyle = "rgba(100, 180, 255, 0.5)";
+          ctx.fill();
+          ctx.strokeStyle = "blue";
+          ctx.stroke();
+        }
+
+        log.textContent += `\nPoligono con ${polygon.length} vertici\nCerchi disegnati: ${circles.length}`;
+      })
+      .catch(err => {
+        log.textContent = "Errore: " + err.message;
+        console.error(err);
+      });
+  </script>
+</body>
+</html>
