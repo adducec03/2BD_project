@@ -16,7 +16,7 @@ def calcola_configurazione_batteria(v_cella, ah_cella, v_target, ah_target, cell
 calcola_configurazione_batteria(
     v_cella=3.6,
     ah_cella=2.5,
-    v_target=34,
-    ah_target=12,
-    celle_disponibili=46
+    v_target=36,
+    ah_target=22,
+    celle_disponibili=94
 )

@@ -1,7 +1,7 @@
 import os
 
 # Percorso della cartella con le foto
-cartella = "photos"  # <-- CAMBIA QUI
+cartella = "json_valeria"  # <-- CAMBIA QUI
 
 # Ottieni solo i file .jpg nella cartella
 file_foto = [f for f in os.listdir(cartella) if f.lower().endswith('.jpg')]
