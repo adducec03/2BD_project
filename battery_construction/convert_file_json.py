@@ -1,7 +1,7 @@
 import json
 
 # === CONFIGURAZIONE ===
-input_file = 'json_valeria/1.json'
+input_file = 'json_valeria/3.json'
 output_file = 'polygon.json'
 
 # === FUNZIONE DI CONVERSIONE ===

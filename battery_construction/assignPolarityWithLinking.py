@@ -75,7 +75,7 @@ def trova_gruppi_con_raggio_adattivo(centers, radius, S, P, raggio_iniziale=2.0,
             print(f"❌ {e}")
     raise ValueError(f"Impossibile formare {S} gruppi di {P} celle adiacenti anche aumentando il raggio.")
 
-def plot_batteria_con_collegamenti(data, radius):
+def plot_batteria_con_collegamenti(data, radius, S, P, ah_tot, v_tot, cells_tot):
     polygon = data["polygon"]
     circles = data["circles"]
     gruppi = data["gruppi"]
@@ -104,7 +104,10 @@ def plot_batteria_con_collegamenti(data, radius):
 
     ax.set_aspect('equal')
     plt.grid(True, alpha=0.3)
-    plt.title("Disposizione batterie con collegamenti in serie")
+    if(P==None or S==None or ah_tot==None or v_tot==None or cells_tot==None):
+        print("Disposizione celle in serie con collegmenti")
+    else:
+        plt.title(f"Disposizione celle in {S}s{P}p\nCapacità:{ah_tot}A\nVoltaggio:{v_tot}V\nNumero celle totali:{cells_tot}")
     plt.show()
 
 def calcola_centroidi_gruppi(centers, gruppi):

@@ -114,7 +114,7 @@ if __name__ == "__main__":
     x, y = zip(*vertices)
     poly = Polygon(vertices)
 
-    circle_radius = 0.2
+    circle_radius = 18
 
     # Trova la miglior disposizione
     best_centers, best_angle = find_best_rotation(poly, circle_radius)
