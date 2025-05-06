@@ -87,7 +87,7 @@ def plot_packing(polygon: Polygon, centers: list, radius: float, title="Packing"
 #metodo che trova la rotazione ottimale per il packing
 def find_best_rotation(polygon: Polygon, radius: float, angles=None):
     if angles is None:
-        angles = np.arange(0, 62, 2)  # Rotazioni da 0° a 55° ogni 5°
+        angles = np.arange(0, 62, 1)  # Rotazioni da 0° a 55° ogni 5°
 
     best_centers = []
     best_angle = 0

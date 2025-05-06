@@ -5,30 +5,33 @@ import convert_file_json as cf
 import json
 import os
 
-input_file = 'json_valeria/3.json'
+input_file = '../json_valeria/4.json'
 battery_diameter = 18
 
 
 if __name__ == "__main__":
 
-    # Ottieni il percorso assoluto della cartella dove si trova *questo* script
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-    # Usa questo per costruire il path del file
-    file_path = os.path.join(BASE_DIR, "polygon.json")
+    polygon_file_path = os.path.join(BASE_DIR, "polygon.json")
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    polygon_with_circles_file_path = os.path.join(BASE_DIR, "polygon_with_circles.json")
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    polygon_with_circles_and_connections_file_path = os.path.join(BASE_DIR, "polygon_with_circles_and_connections.json")
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    input_file_path = os.path.join(BASE_DIR, input_file)
 
 
     # 1. Converti file json
     try:
-        poligono = cf.estrai_poligono_da_json(input_file)
-        cf.salva_poligono_su_file(poligono, file_path)
+        poligono = cf.estrai_poligono_da_json(input_file_path)
+        cf.salva_poligono_su_file(poligono, polygon_file_path)
         print(f"Poligono salvato in polygon.json con successo.")
     except Exception as e:
         print(f"Errore: {e}")
 
 
-# 2. Circle packing
-    with open(file_path, "r") as f:
+    # 2. Circle packing
+    with open(polygon_file_path, "r") as f:
         vertices = json.load(f)
     x, y = zip(*vertices)
     poly = cp.Polygon(vertices)
@@ -42,7 +45,7 @@ if __name__ == "__main__":
             for x, y in best_centers
         ]
     }
-    with open("polygon_with_circles.json", "w") as f:
+    with open(polygon_with_circles_file_path, "w") as f:
         json.dump(export_data, f, indent=2)
 
 
@@ -53,7 +56,7 @@ if __name__ == "__main__":
     # 4. Assegna le polarità alle celle e crea i collegamenti
     S, P, v_tot, ah_tot = config
     used_cells=S*P
-    with open("polygon_with_circles.json", "r") as f:
+    with open(polygon_with_circles_file_path, "r") as f:
         data = json.load(f)
     polygon = data["polygon"]
     circles = data["circles"]
@@ -68,10 +71,10 @@ if __name__ == "__main__":
         "gruppi": gruppi,
         "serie_connections": connessioni
     }
-    with open("polygon_with_circles_and_connections.json", "w") as f:
+    with open(polygon_with_circles_and_connections_file_path, "w") as f:
         json.dump(data_output, f, indent=2)
     print("✅ File salvato: polygon_with_circles_and_connections.json")
-    with open("polygon_with_circles_and_connections.json", "r") as f:
+    with open(polygon_with_circles_and_connections_file_path, "r") as f:
         data_loaded = json.load(f)
     ap.plot_batteria_con_collegamenti(data_loaded, radius,S,P,ah_tot,v_tot,used_cells)
 
