@@ -32,6 +32,46 @@ def generate_hex_grid(polygon: Polygon, radius: float, angle: float = 0):
     rotated_back = [affinity.rotate(Point(x, y), -angle, origin=polygon.centroid) for x, y in points]
     return [(p.x, p.y) for p in rotated_back]
 
+def generate_aligned_hex_grid(polygon: Polygon, radius: float, margin=3):
+    """Genera una griglia esagonale allineata per rettangoli/quadrati partendo dal bordo, con margine fisso."""
+    # Trova il rettangolo ruotato minimo per considerare i rettangoli inclinati
+    oriented_bbox = polygon.minimum_rotated_rectangle
+    bbox_coords = list(oriented_bbox.exterior.coords)[:4]
+
+    # Calcolo dell'angolo di rotazione del bounding box rispetto agli assi
+    v1 = np.array(bbox_coords[1]) - np.array(bbox_coords[0])
+    angle = np.degrees(np.arctan2(v1[1], v1[0]))
+
+    # Ruota il poligono per allinearlo con gli assi
+    aligned_polygon = affinity.rotate(polygon, -angle, origin='centroid')
+
+    minx, miny, maxx, maxy = aligned_polygon.bounds
+    dx = 2 * radius
+    dy = np.sqrt(3) * radius
+
+    # Calcolo del margine in coordinate
+    margin_x = (maxx - minx) * (margin / 1000)  # Approssimazione per il margine
+    margin_y = (maxy - miny) * (margin / 1000)
+
+    points = []
+    y = miny + radius + margin_y  # Partenza dal bordo inferiore con margine
+    row = 0
+
+    while y <= maxy - radius - margin_y:
+        # Allineamento alla colonna sinistra con margine
+        x = minx + (radius if row % 2 else 0) + margin_x
+        while x <= maxx - radius - margin_x:
+            center = Point(x, y)
+            if aligned_polygon.contains(center.buffer(radius)):
+                points.append((x, y))
+            x += dx
+        y += dy
+        row += 1
+
+    # Ruota indietro i punti per tornare alla posizione originale
+    aligned_back = [affinity.rotate(Point(x, y), angle, origin=polygon.centroid) for x, y in points]
+    return [(p.x, p.y) for p in aligned_back]
+
 
 #metodo che controlla se un nuovo cerchio può essere aggiunto senza collisioni
 def add_extra_circles(polygon: Polygon, existing_centers: list, radius: float, spacing: float = 0.5):
@@ -67,7 +107,6 @@ def add_extra_circles(polygon: Polygon, existing_centers: list, radius: float, s
     return new_points
 
 
-
 def plot_packing(polygon: Polygon, centers: list, radius: float, title="Packing"):
     fig, ax = plt.subplots()
     x, y = polygon.exterior.xy
@@ -87,7 +126,7 @@ def plot_packing(polygon: Polygon, centers: list, radius: float, title="Packing"
 #metodo che trova la rotazione ottimale per il packing
 def find_best_rotation(polygon: Polygon, radius: float, angles=None):
     if angles is None:
-        angles = np.arange(0, 62, 1)  # Rotazioni da 0° a 55° ogni 5°
+        angles = np.arange(0, 62, 2)  # Rotazioni da 0° a 55° ogni 5°
 
     best_centers = []
     best_angle = 0
@@ -104,26 +143,62 @@ def find_best_rotation(polygon: Polygon, radius: float, angles=None):
 
     return best_centers, best_angle
 
+def is_rectangle_or_square(polygon: Polygon, angle_tolerance=2.0, length_tolerance=1e-2):
+    """Verifica se il poligono è un rettangolo o quadrato, anche se leggermente inclinato."""
+    coords = list(polygon.exterior.coords)
+    if len(coords) != 5:  # Un rettangolo ha 4 lati (più uno chiuso)
+        return False
+
+    # Trova il bounding box orientato (per rettangoli inclinati)
+    oriented_bbox = polygon.minimum_rotated_rectangle
+    bbox_coords = list(oriented_bbox.exterior.coords)[:4]
+
+    # Calcolo delle lunghezze dei lati del bounding box
+    lengths = [np.linalg.norm(np.array(bbox_coords[i]) - np.array(bbox_coords[(i + 1) % 4])) for i in range(4)]
+    angles = []
+
+    for i in range(4):
+        v1 = np.array(bbox_coords[(i + 1) % 4]) - np.array(bbox_coords[i])
+        v2 = np.array(bbox_coords[(i + 2) % 4]) - np.array(bbox_coords[(i + 1) % 4])
+        angle = np.arccos(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
+        angles.append(np.degrees(angle))
+
+    # Verifica che i lati opposti siano uguali e che gli angoli siano circa 90°
+    return (np.isclose(lengths[0], lengths[2], atol=length_tolerance) and
+            np.isclose(lengths[1], lengths[3], atol=length_tolerance) and
+            all(np.isclose(angle, 90, atol=angle_tolerance) for angle in angles))
+
+def find_best_packing(polygon: Polygon, radius: float):
+    """Sceglie il miglior metodo di packing a seconda della forma."""
+    if is_rectangle_or_square(polygon):
+        print("🟦 Rilevato rettangolo/quadrato: uso griglia esagonale allineata al bordo.")
+        best_centers = generate_aligned_hex_grid(polygon, radius)
+        best_angle = 0
+    else:
+        print("🔄 Forma irregolare: uso disposizione esagonale con rotazione ottimizzata.")
+        best_centers, best_angle = find_best_rotation(polygon, radius)
+    
+    return best_centers, best_angle
+
 
 if __name__ == "__main__":
     # Carica i punti
     with open("polygon.json", "r") as f:
         vertices = json.load(f)
 
-    # Separali in X e Y
     x, y = zip(*vertices)
     poly = Polygon(vertices)
 
     circle_radius = 18
 
-    # Trova la miglior disposizione
-    best_centers, best_angle = find_best_rotation(poly, circle_radius)
+    # Trova la miglior disposizione con il metodo adattivo
+    best_centers, best_angle = find_best_packing(poly, circle_radius)
 
-    # Visualizza
-    plot_packing(poly, best_centers, circle_radius, title=f"Rotazione ottimale: {best_angle}°")
+    # Visualizza il risultato
+    plot_packing(poly, best_centers, circle_radius, title=f"Disposizione ottimale (Angolo: {best_angle}°)")
     print(f"Rotazione migliore: {best_angle}°, Totale cerchi: {len(best_centers)}")
 
-    # Prepara il JSON da esportare
+    # Salva il risultato
     export_data = {
         "polygon": vertices,
         "circles": [
@@ -132,8 +207,7 @@ if __name__ == "__main__":
         ]
     }
 
-    # Esporta in JSON
     with open("polygon_with_circles.json", "w") as f:
         json.dump(export_data, f, indent=2)
 
-    print("Risultato esportato in 'polygon_with_circles.json'")
+    print("✅ Risultato esportato in 'polygon_with_circles.json'")

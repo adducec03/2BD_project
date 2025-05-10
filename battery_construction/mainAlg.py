@@ -5,7 +5,7 @@ import convert_file_json as cf
 import json
 import os
 
-input_file = '../json_valeria/4.json'
+input_file = '../json_valeria/7.json'
 battery_diameter = 18
 
 
