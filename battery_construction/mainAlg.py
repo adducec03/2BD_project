@@ -2,22 +2,22 @@ import circlePacking as cp
 import assignPolarityWithLinking as ap
 import findBestConfiguration as fc
 import convert_file_json as cf
+import construction3D as td
 import json
 import os
 
-input_file = '../json_valeria/7.json'
+input_file = '../json_chat/10.json'
 battery_diameter = 18
+battery_height = 65
 
 
 if __name__ == "__main__":
 
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     polygon_file_path = os.path.join(BASE_DIR, "polygon.json")
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     polygon_with_circles_file_path = os.path.join(BASE_DIR, "polygon_with_circles.json")
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     polygon_with_circles_and_connections_file_path = os.path.join(BASE_DIR, "polygon_with_circles_and_connections.json")
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    battery3D_file_path = os.path.join(BASE_DIR, "battery3D.glb")
     input_file_path = os.path.join(BASE_DIR, input_file)
 
 
@@ -35,8 +35,8 @@ if __name__ == "__main__":
         vertices = json.load(f)
     x, y = zip(*vertices)
     poly = cp.Polygon(vertices)
-    circle_radius = battery_diameter
-    best_centers, best_angle = cp.find_best_rotation(poly, circle_radius)
+    circle_radius = battery_diameter/2
+    best_centers, best_angle = cp.find_best_packing(poly, circle_radius)
     max_cells = len(best_centers)
     export_data = {
         "polygon": vertices,
@@ -77,5 +77,8 @@ if __name__ == "__main__":
     with open(polygon_with_circles_and_connections_file_path, "r") as f:
         data_loaded = json.load(f)
     ap.plot_batteria_con_collegamenti(data_loaded, radius,S,P,ah_tot,v_tot,used_cells)
+
+    # 5. Converti da 2D a 3D
+    td.convert_2d_to_3d(battery_height, polygon_with_circles_and_connections_file_path, battery3D_file_path)
 
     

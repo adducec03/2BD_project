@@ -126,7 +126,7 @@ def plot_packing(polygon: Polygon, centers: list, radius: float, title="Packing"
 #metodo che trova la rotazione ottimale per il packing
 def find_best_rotation(polygon: Polygon, radius: float, angles=None):
     if angles is None:
-        angles = np.arange(0, 62, 2)  # Rotazioni da 0° a 55° ogni 5°
+        angles = np.arange(0, 62, 1)  # Rotazioni da 0° a 55° ogni 5°
 
     best_centers = []
     best_angle = 0
@@ -143,30 +143,27 @@ def find_best_rotation(polygon: Polygon, radius: float, angles=None):
 
     return best_centers, best_angle
 
-def is_rectangle_or_square(polygon: Polygon, angle_tolerance=2.0, length_tolerance=1e-2):
-    """Verifica se il poligono è un rettangolo o quadrato, anche se leggermente inclinato."""
+def is_rectangle_or_square(polygon: Polygon, angle_tolerance=5.0):
+    """Verifica se il poligono è un rettangolo o quadrato basato sugli angoli interni."""
     coords = list(polygon.exterior.coords)
     if len(coords) != 5:  # Un rettangolo ha 4 lati (più uno chiuso)
         return False
 
-    # Trova il bounding box orientato (per rettangoli inclinati)
-    oriented_bbox = polygon.minimum_rotated_rectangle
-    bbox_coords = list(oriented_bbox.exterior.coords)[:4]
-
-    # Calcolo delle lunghezze dei lati del bounding box
-    lengths = [np.linalg.norm(np.array(bbox_coords[i]) - np.array(bbox_coords[(i + 1) % 4])) for i in range(4)]
     angles = []
-
     for i in range(4):
-        v1 = np.array(bbox_coords[(i + 1) % 4]) - np.array(bbox_coords[i])
-        v2 = np.array(bbox_coords[(i + 2) % 4]) - np.array(bbox_coords[(i + 1) % 4])
-        angle = np.arccos(np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2)))
-        angles.append(np.degrees(angle))
+        v1 = np.array(coords[i + 1]) - np.array(coords[i])
+        v2 = np.array(coords[(i + 2) % 4]) - np.array(coords[i + 1])
+        
+        # Calcola l'angolo tra i vettori
+        dot_product = np.dot(v1, v2)
+        norm_product = np.linalg.norm(v1) * np.linalg.norm(v2)
+        angle = np.degrees(np.arccos(dot_product / norm_product))
+        angles.append(angle)
 
-    # Verifica che i lati opposti siano uguali e che gli angoli siano circa 90°
-    return (np.isclose(lengths[0], lengths[2], atol=length_tolerance) and
-            np.isclose(lengths[1], lengths[3], atol=length_tolerance) and
-            all(np.isclose(angle, 90, atol=angle_tolerance) for angle in angles))
+    # Verifica che tutti gli angoli siano circa 90°
+    if all(np.isclose(angle, 90, atol=angle_tolerance) for angle in angles):
+        return True
+    return False
 
 def find_best_packing(polygon: Polygon, radius: float):
     """Sceglie il miglior metodo di packing a seconda della forma."""
@@ -189,7 +186,7 @@ if __name__ == "__main__":
     x, y = zip(*vertices)
     poly = Polygon(vertices)
 
-    circle_radius = 18
+    circle_radius = 9
 
     # Trova la miglior disposizione con il metodo adattivo
     best_centers, best_angle = find_best_packing(poly, circle_radius)

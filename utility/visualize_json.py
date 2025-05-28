@@ -1,34 +1,34 @@
 import json
 import matplotlib.pyplot as plt
 
-# === CONFIGURAZIONE ===
-file_path = 'polygon_with_circles_and_connections.json'  # <-- cambia nome file se necessario
+# Carica i dati JSON da un file
+with open('polygon_with_circles.json', 'r') as file:
+    data = json.load(file)
 
-# === FUNZIONE DI VISUALIZZAZIONE ===
-def visualizza_poligono_da_lista(percorso_file):
-    try:
-        with open(percorso_file, 'r') as f:
-            polygon = json.load(f)
+# Estrai il poligono e i cerchi
+polygon = data['polygon']
+circles = data['circles']
 
-        if not isinstance(polygon, list) or not all(isinstance(p, list) and len(p) == 2 for p in polygon):
-            raise ValueError("Il file JSON non contiene una lista valida di coordinate [x, y].")
+# Imposta il grafico
+fig, ax = plt.subplots()
+ax.set_aspect('equal')
+plt.title('Visualizzazione Poligono e Cerchi')
 
-        # Separiamo le coordinate in X e Y
-        x, y = zip(*polygon)
+# Disegna il poligono
+polygon_x, polygon_y = zip(*polygon)
+plt.plot(polygon_x, polygon_y, marker='o', linestyle='-', color='blue', label='Poligono')
 
-        plt.figure(figsize=(8, 6))
-        plt.plot(x, y, marker='o', linestyle='-', color='blue')
-        plt.fill(x, y, alpha=0.2, color='skyblue')  # riempimento opzionale
-        plt.title('Visualizzazione del Poligono')
-        plt.xlabel('X')
-        plt.ylabel('Y')
-        plt.grid(True)
-        plt.axis('equal')
-        plt.show()
+# Disegna i cerchi
+for circle in circles:
+    center = circle['center']
+    radius = circle['radius']
+    circle_patch = plt.Circle(center, radius, color='red', alpha=0.5)
+    ax.add_patch(circle_patch)
 
-    except Exception as e:
-        print(f"Errore: {e}")
+# Imposta i limiti degli assi
+ax.set_xlim(0, 800)
+ax.set_ylim(0, 600)
 
-# === ESECUZIONE ===
-if __name__ == "__main__":
-    visualizza_poligono_da_lista(file_path)
+# Mostra la legenda e il grafico
+plt.legend()
+plt.show()

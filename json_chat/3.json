@@ -1,0 +1,19 @@
+{
+    "timestamp": "2025-05-28T00:00:00.000Z",
+    "batteryParameters": {
+      "batteryType": "",
+      "ratedCapacity": "",
+      "maxDischarge": "",
+      "nominalVoltage": "",
+      "maxChargeVoltage": "",
+      "chargingCurrent": "",
+      "totalVoltage": ""
+    },
+    "lines": [
+      { "x1": 50, "y1": 40, "x2": 190, "y2": 50 },
+      { "x1": 190, "y1": 50, "x2": 210, "y2": 140 },
+      { "x1": 210, "y1": 140, "x2": 120, "y2": 200 },
+      { "x1": 120, "y1": 200, "x2": 60, "y2": 130 },
+      { "x1": 60, "y1": 130, "x2": 50, "y2": 40 }
+    ]
+  }
