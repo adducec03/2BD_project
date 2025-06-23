@@ -1,0 +1,5 @@
+path: my_dataset
+train: images/train
+val: images/val
+names:
+  - cella
