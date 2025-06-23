@@ -136,7 +136,7 @@ def find_best_rotation(polygon: Polygon, radius: float, angles=None):
         extra_centers = add_extra_circles(polygon, base_centers, radius)
         total = base_centers + extra_centers
 
-        print(f"Rotazione {angle}° -> Totale cerchi: {len(total)}")
+        #print(f"Rotazione {angle}° -> Totale cerchi: {len(total)}")
         if len(total) > len(best_centers):
             best_centers = total
             best_angle = angle
@@ -168,11 +168,11 @@ def is_rectangle_or_square(polygon: Polygon, angle_tolerance=5.0):
 def find_best_packing(polygon: Polygon, radius: float):
     """Sceglie il miglior metodo di packing a seconda della forma."""
     if is_rectangle_or_square(polygon):
-        print("🟦 Rilevato rettangolo/quadrato: uso griglia esagonale allineata al bordo.")
+        #print("🟦 Rilevato rettangolo/quadrato: uso griglia esagonale allineata al bordo.")
         best_centers = generate_aligned_hex_grid(polygon, radius)
         best_angle = 0
     else:
-        print("🔄 Forma irregolare: uso disposizione esagonale con rotazione ottimizzata.")
+        #print("🔄 Forma irregolare: uso disposizione esagonale con rotazione ottimizzata.")
         best_centers, best_angle = find_best_rotation(polygon, radius)
     
     return best_centers, best_angle
@@ -192,8 +192,8 @@ if __name__ == "__main__":
     best_centers, best_angle = find_best_packing(poly, circle_radius)
 
     # Visualizza il risultato
-    plot_packing(poly, best_centers, circle_radius, title=f"Disposizione ottimale (Angolo: {best_angle}°)")
-    print(f"Rotazione migliore: {best_angle}°, Totale cerchi: {len(best_centers)}")
+    #plot_packing(poly, best_centers, circle_radius, title=f"Disposizione ottimale (Angolo: {best_angle}°)")
+    #print(f"Rotazione migliore: {best_angle}°, Totale cerchi: {len(best_centers)}")
 
     # Salva il risultato
     export_data = {
@@ -207,4 +207,4 @@ if __name__ == "__main__":
     with open("polygon_with_circles.json", "w") as f:
         json.dump(export_data, f, indent=2)
 
-    print("✅ Risultato esportato in 'polygon_with_circles.json'")
+    #print("✅ Risultato esportato in 'polygon_with_circles.json'")

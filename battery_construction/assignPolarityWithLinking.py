@@ -9,14 +9,14 @@ def calcola_configurazione_batteria(v_cella, ah_cella, v_target, ah_target, cell
     p = round(ah_target / ah_cella)
     totale = s * p
 
-    print(f"Configurazione suggerita: {s}S{p}P")
-    print(f"Celle totali richieste: {totale}")
+    #print(f"Configurazione suggerita: {s}S{p}P")
+    #print(f"Celle totali richieste: {totale}")
 
-    if totale <= celle_disponibili:
-        print("✅ Le celle entrano nella forma disponibile.")
-    else:
-        print("⚠️ Troppe celle. Considera di abbassare la capacità o cambiare disposizione.")
-    return s, p, totale
+    #if totale <= celle_disponibili:
+    #    print("✅ Le celle entrano nella forma disponibile.")
+    #else:
+    #    print("⚠️ Troppe celle. Considera di abbassare la capacità o cambiare disposizione.")
+    #return s, p, totale
 
 def costruisci_grafo_adiacenza(centers, distanza_massima):
     G = nx.Graph()
@@ -65,15 +65,15 @@ def estrai_gruppi_connessi(G, S, P):
 def trova_gruppi_con_raggio_adattivo(centers, radius, S, P, raggio_iniziale=2.0, raggio_massimo=6.0, passo=0.5):
     for moltiplicatore in np.arange(raggio_iniziale, raggio_massimo + passo, passo):
         distanza = moltiplicatore * radius
-        print(f"Tentativo con distanza massima: {distanza:.2f}")
+        #print(f"Tentativo con distanza massima: {distanza:.2f}")
         G = costruisci_grafo_adiacenza(centers, distanza)
-        try:
-            gruppi = estrai_gruppi_connessi(G, S, P)
-            print(f"✅ Gruppi trovati con distanza {distanza:.2f}")
-            return gruppi
-        except ValueError as e:
-            print(f"❌ {e}")
-    raise ValueError(f"Impossibile formare {S} gruppi di {P} celle adiacenti anche aumentando il raggio.")
+        #try:
+        gruppi = estrai_gruppi_connessi(G, S, P)
+            #print(f"✅ Gruppi trovati con distanza {distanza:.2f}")
+        return gruppi
+        #except ValueError as e:
+            #print(f"❌ {e}")
+    #raise ValueError(f"Impossibile formare {S} gruppi di {P} celle adiacenti anche aumentando il raggio.")
 
 def plot_batteria_con_collegamenti(data, radius, S, P, ah_tot, v_tot, cells_tot):
     polygon = data["polygon"]
@@ -208,10 +208,9 @@ if __name__ == "__main__":
     with open("polygon_with_circles_and_connections.json", "w") as f:
         json.dump(data_output, f, indent=2)
 
-    print("✅ File salvato: polygon_with_circles_and_connections.json")
+    #print("✅ File salvato: polygon_with_circles_and_connections.json")
 
     # 6. Visualizza il file salvato
-    with open("polygon_with_circles_and_connections.json", "r") as f:
-        data_loaded = json.load(f)
-
-    plot_batteria_con_collegamenti(data_loaded, radius)
+    #with open("polygon_with_circles_and_connections.json", "r") as f:
+    #    data_loaded = json.load(f)
+    #plot_batteria_con_collegamenti(data_loaded, radius)

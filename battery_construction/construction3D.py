@@ -5,7 +5,7 @@ from trimesh.creation import cylinder
 from trimesh.visual import color as color_utils
 
 
-def convert_2d_to_3d(h,input,output):
+def convert_2d_to_3d(h,input,output,model):
 
     # CONFIGURAZIONE
     SEZIONI = 32    # Risoluzione cilindro
@@ -55,20 +55,48 @@ def convert_2d_to_3d(h,input,output):
     for i, circle in enumerate(circles):
         x, y = circle["center"]
         r = circle["radius"]
-
         gruppo = circle_to_group.get(i, 0)
         colore = COLORI[gruppo % len(COLORI)]
 
-        # Crea cilindro centrato sull'origine
-        cyl = cylinder(radius=r, height=ALTEZZA, sections=SEZIONI)
+        # Carica il modello della batteria da file
+        loaded = trimesh.load(model)
 
-        # Applica colore al cilindro
-        cyl.visual.vertex_colors = np.tile(colore, (len(cyl.vertices), 1))
+        # Se è una scena, estrai la mesh unificata
+        if isinstance(loaded, trimesh.Scene):
+            battery_mesh = loaded.dump(concatenate=True)
+        else:
+            battery_mesh = loaded
 
-        # Posiziona il cilindro
-        cyl.apply_translation([x, y, ALTEZZA / 2])
+        rot_x = trimesh.transformations.rotation_matrix(
+            angle=np.pi / 2,  # 90 gradi
+            direction=[1, 0, 0],
+            point=[0, 0, 0]
+        )
+        battery_mesh.apply_transform(rot_x)
 
-        all_meshes.append(cyl)
+        # Copia per ogni batteria (per non sovrascrivere il modello)
+        battery_instance = battery_mesh.copy()
+
+        # Rotazione condizionata (se "polarita": -1, ruota di 180° sull'asse Z)
+        polarita = circle.get("polarita", 1)
+        if polarita == -1:
+            # Ruota sull’asse Z di 180° (pi greco radianti)
+            rot_x_180 = trimesh.transformations.rotation_matrix(
+                angle=np.pi, direction=[0, 1, 0], point=[0, 0, 0]
+            )
+            battery_instance.apply_transform(rot_x_180)
+            battery_instance.apply_translation([0, 0, ALTEZZA])
+
+        # Posizione della batteria
+        battery_instance.apply_translation([x, y, ALTEZZA / 2])
+
+        #battery_instance.visual.material = None
+
+        # 👉 Applica colore per gruppo
+        #battery_instance.visual.vertex_colors = np.tile(colore, (len(battery_instance.vertices), 1))
+
+        # Colora se vuoi (opzionale: richiede materiali separati per gruppo)
+        all_meshes.append(battery_instance)
 
     # Unisci tutti i cilindri
     scene = trimesh.util.concatenate(all_meshes)

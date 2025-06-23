@@ -1,30 +1,23 @@
-def configurazione_bilanciata(celle_totali, v_cella=3.6, ah_cella=2.5):
-    migliore = None
-    differenza_minima = float("inf")
+import math
 
-    for s in range(1, celle_totali + 1):
-        if celle_totali % s != 0:
-            continue
-        p = celle_totali // s
+def calcola_disposizione(tensione_cella, corrente_cella, tensione_batteria, corrente_batteria):
+    if any(x <= 0 for x in [tensione_cella, corrente_cella, tensione_batteria, corrente_batteria]):
+        raise ValueError("Tutti i valori devono essere positivi.")
 
-        v_tot = s * v_cella
-        ah_tot = p * ah_cella
+    # Celle in serie (S): determinano la tensione
+    S = math.ceil(tensione_batteria / tensione_cella)
 
-        rapporto = v_tot / ah_tot
-        differenza = abs(rapporto - 1)  # vogliamo V/Ah ≈ 1
+    # Celle in parallelo (P): determinano la corrente (capacità totale)
+    P = math.ceil(corrente_batteria / corrente_cella)
 
-        if differenza < differenza_minima:
-            differenza_minima = differenza
-            migliore = (s, p, v_tot, ah_tot)
+    tensione_totale_effettiva = S * tensione_cella
+    corrente_totale_effettiva = P * corrente_cella
+    celle_totali = S * P
 
-    if migliore is None:
-        raise ValueError("Nessuna configurazione bilanciata trovata.")
-    
-    s, p, v_tot, ah_tot = migliore
-    print(f"⚖️ Configurazione bilanciata trovata: {s}S{p}P → {v_tot:.2f} V, {ah_tot:.2f} Ah (V/Ah = {v_tot/ah_tot:.2f})")
-    return migliore
-
-# Esempio d'uso
-if __name__ == "__main__":
-    celle = 94  # prova con 94 celle
-    configurazione_bilanciata(celle)
+    return {
+        "S": S,
+        "P": P,
+        "celle_totali": celle_totali,
+        "tensione_effettiva": tensione_totale_effettiva,
+        "corrente_effettiva": corrente_totale_effettiva
+    }
