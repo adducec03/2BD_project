@@ -24,15 +24,41 @@ def estrai_poligono_e_dati(percorso_file):
 
     try:
         disegno = json.loads(disegno_str)
-        vertici = disegno["disegno"]["vertici"]
-        polygon = [[v["x"], v["y"]] for v in vertici]
+        lines = disegno["disegno"]["lines"]
     except (json.JSONDecodeError, KeyError) as e:
-        raise ValueError("Errore nel parsing di 'disegnoJson' o nei dati interni.") from e
+        raise ValueError("Errore nel parsing di 'disegnoJson'.") from e
 
+    # Costruisci un grafo di connessioni punto → [successori]
+    from collections import defaultdict, deque
+
+    connessioni = defaultdict(list)
+    for line in lines:
+        pt1 = (line["x1"], line["y1"])
+        pt2 = (line["x2"], line["y2"])
+        connessioni[pt1].append(pt2)
+        connessioni[pt2].append(pt1)  # bidirezionale
+
+    # Trova un punto di partenza (uno qualsiasi)
+    start = next(iter(connessioni))
+    visited = set()
+    polygon = []
+
+    # DFS per seguire i punti connessi in sequenza
+    def dfs(p, prev=None):
+        polygon.append(list(p))
+        visited.add(p)
+        for neighbor in connessioni[p]:
+            if neighbor != prev and neighbor not in visited:
+                dfs(neighbor, p)
+
+    dfs(start)
+
+    # Chiudi il poligono se non è già chiuso
     if polygon[0] != polygon[-1]:
         polygon.append(polygon[0])
 
-    polygon_filename = "polygon.json"
+    # Salva su file
+    polygon_filename = f"polygon_{battery_id}.json"
     with open(polygon_filename, 'w') as f:
         json.dump(polygon, f, indent=2)
 

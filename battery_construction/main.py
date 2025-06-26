@@ -26,7 +26,6 @@ model_battery_file_path = os.path.join(BASE_DIR, "model_battery.glb")
 def elabora_dati(input_file_path):
 
     
-    
     # 1. Converti file json
     polygon_file_path, battery_data = cf.estrai_poligono_e_dati(input_file_path)
 
@@ -42,7 +41,14 @@ def elabora_dati(input_file_path):
 
     # 2. Circle packing
     with open(polygon_file_path, "r") as f:
-        vertices = json.load(f)
+        polygon_data = json.load(f)
+
+    # Supporta sia il nuovo formato che quello vecchio
+    if isinstance(polygon_data, dict) and "vertices" in polygon_data:
+        vertices = polygon_data["vertices"]
+    else:
+        vertices = polygon_data  # fallback: lista pura di punti
+
     x, y = zip(*vertices)
     poly = cp2.Polygon(vertices)
     circle_radius = battery_diameter/2
@@ -155,8 +161,3 @@ async def process_files(file: UploadFile = File(...)):
 #    if(process_files==None):
 #        input_file_path = os.path.join(BASE_DIR, input_file)
 #        elabora_dati(input_file_path)
-
-
- 
-
-    

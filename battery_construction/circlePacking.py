@@ -191,10 +191,7 @@ if __name__ == "__main__":
     # Trova la miglior disposizione con il metodo adattivo
     best_centers, best_angle = find_best_packing(poly, circle_radius)
 
-    # Visualizza il risultato
-    #plot_packing(poly, best_centers, circle_radius, title=f"Disposizione ottimale (Angolo: {best_angle}°)")
-    #print(f"Rotazione migliore: {best_angle}°, Totale cerchi: {len(best_centers)}")
-
+   
     # Salva il risultato
     export_data = {
         "polygon": vertices,
@@ -207,4 +204,3 @@ if __name__ == "__main__":
     with open("polygon_with_circles.json", "w") as f:
         json.dump(export_data, f, indent=2)
 
-    #print("✅ Risultato esportato in 'polygon_with_circles.json'")
