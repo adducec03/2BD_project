@@ -1,5 +1,4 @@
 import numpy as np
-import matplotlib.pyplot as plt
 from shapely.geometry import Polygon, Point
 from shapely.affinity import rotate
 import json
@@ -61,47 +60,3 @@ def find_best_packing(polygon: Polygon, radius: float):
         best_angle = 0
 
     return centers, best_angle
-
-#def plot_packing(polygon: Polygon, centers: list, radius: float, title="Packing Result"):
-#    fig, ax = plt.subplots()
-#    x, y = polygon.exterior.xy
-#    ax.plot(x, y, color='black')
-#
-#    for cx, cy in centers:
-#        circle = plt.Circle((cx, cy), radius, edgecolor='blue', facecolor='lightblue', alpha=0.6)
-#        ax.add_patch(circle)
-#
-#    ax.set_aspect('equal')
-#    ax.set_xlim(polygon.bounds[0] - radius, polygon.bounds[2] + radius)
-#    ax.set_ylim(polygon.bounds[1] - radius, polygon.bounds[3] + radius)
-#    plt.title(f"{title} - Cerchi totali: {len(centers)}")
-#    plt.show()
-
-if __name__ == "__main__":
-    # Carica i punti
-    with open("1.json", "r") as f:
-        vertices = json.load(f)
-
-    x, y = zip(*vertices)
-    poly = Polygon(vertices)
-    circle_radius = 9
-
-    # Trova la miglior disposizione con il metodo adattivo
-    best_centers, best_angle = find_best_packing(poly, circle_radius)
-
-    # Visualizza il risultato
-#    plot_packing(poly, best_centers, circle_radius, title=f"Disposizione ottimale (Angolo: {best_angle}°)")
-
-    # Salva il risultato
-    export_data = {
-        "polygon": vertices,
-        "circles": [
-            {"center": [x, y], "radius": circle_radius}
-            for x, y in best_centers
-        ]
-    }
-
-    with open("polygon_with_circles.json", "w") as f:
-        json.dump(export_data, f, indent=2)
-
-    print(f"✅ Cerchi trovati: {len(best_centers)} | Rotazione migliore: {best_angle:.1f}°")

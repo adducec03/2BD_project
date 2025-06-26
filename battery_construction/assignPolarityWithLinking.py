@@ -1,5 +1,4 @@
 import json
-import matplotlib.pyplot as plt
 import numpy as np
 from collections import deque
 import networkx as nx
@@ -75,40 +74,6 @@ def trova_gruppi_con_raggio_adattivo(centers, radius, S, P, raggio_iniziale=2.0,
             #print(f"❌ {e}")
     #raise ValueError(f"Impossibile formare {S} gruppi di {P} celle adiacenti anche aumentando il raggio.")
 
-def plot_batteria_con_collegamenti(data, radius, S, P, ah_tot, v_tot, cells_tot):
-    polygon = data["polygon"]
-    circles = data["circles"]
-    gruppi = data["gruppi"]
-    connessioni = data["serie_connections"]
-
-    centers = [tuple(c["center"]) for c in circles]
-
-    fig, ax = plt.subplots(figsize=(12, 8))
-    x, y = zip(*polygon)
-    ax.plot(x, y, color='black', linewidth=2)
-
-    colors = plt.cm.get_cmap('tab20', len(gruppi))
-    for idx, gruppo in enumerate(gruppi):
-        polarity = '+' if idx % 2 == 0 else '-'
-        for n in gruppo:
-            cx, cy = centers[n]
-            circle = plt.Circle((cx, cy), radius, edgecolor='black', facecolor=colors(idx), alpha=0.6)
-            ax.add_patch(circle)
-            ax.text(cx, cy, f"{polarity}\nG{idx}", ha='center', va='center', fontsize=8, weight='bold')
-
-    # Disegna collegamenti tra centroidi
-    for conn in connessioni:
-        x_vals = [conn["from"][0], conn["to"][0]]
-        y_vals = [conn["from"][1], conn["to"][1]]
-        ax.plot(x_vals, y_vals, color='red', linestyle='--', linewidth=2)
-
-    ax.set_aspect('equal')
-    plt.grid(True, alpha=0.3)
-    if(P==None or S==None or ah_tot==None or v_tot==None or cells_tot==None):
-        print("Disposizione celle in serie con collegmenti")
-    else:
-        plt.title(f"Disposizione celle in {S}s{P}p\nCapacità:{ah_tot}A\nVoltaggio:{v_tot}V\nNumero celle totali:{cells_tot}")
-    plt.show()
 
 def calcola_centroidi_gruppi(centers, gruppi):
     centroidi = []

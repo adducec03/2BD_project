@@ -1,5 +1,4 @@
 import datetime
-import circlePacking as cp
 import circlePacking2 as cp2
 import assignPolarityWithLinking as ap
 import findBestConfiguration as fc
@@ -7,14 +6,13 @@ import convert_file_json as cf
 import construction3D as td
 import json
 import os
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import FileResponse
 import shutil
 import uuid
 import zipfile
 
-input_file = '../json_chat/9.json'
 app = FastAPI()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -68,6 +66,12 @@ def elabora_dati(input_file_path):
     v_tot = config.get("tensione_effettiva")
     ah_tot = config.get("corrente_effettiva")
 
+    #controllo sul numero di celle massimo
+    if S * P > max_cells:
+        raise HTTPException(
+            status_code=400,
+            detail="Numero di celle richiesto troppo alto per la forma fornita."
+        )
 
     # 4. Assegna le polarità alle celle e crea i collegamenti
     used_cells=S*P
@@ -122,7 +126,7 @@ def elabora_dati(input_file_path):
 async def process_files(file: UploadFile = File(...)):
     print(f"📥 Ricevuto file: {file.filename}")
     input_id = uuid.uuid4().hex
-    input_file_path = os.path.join(BASE_DIR, f"input_{input_id}.json")
+    input_file_path = "input.json"
     output_json_path = "fullOutput.json"
     output_glb_path = "battery3D.glb"
     zip_path = "output.zip"
@@ -137,7 +141,7 @@ async def process_files(file: UploadFile = File(...)):
     # Comprimiamo i due file da restituire in un .zip
     with zipfile.ZipFile(zip_path, 'w') as zipf:
         zipf.write(output_json_path, arcname="output.json")
-        zipf.write(output_glb_path, arcname="model.glb")
+        #zipf.write(output_glb_path, arcname="model.glb")
 
     return FileResponse(zip_path, media_type='application/zip', filename="output_package.zip")
 
@@ -153,6 +157,6 @@ async def process_files(file: UploadFile = File(...)):
 #        elabora_dati(input_file_path)
 
 
-
+ 
 
     
