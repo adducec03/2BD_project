@@ -1,0 +1,10 @@
+# Ignora file con estensioni specifiche
+*.json
+*.glb
+*.zip
+
+# Ignora cartelle specifiche
+__pycache__/
+json_valeria/
+json_chat/
+tmp/
