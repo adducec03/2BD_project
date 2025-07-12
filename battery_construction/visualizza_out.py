@@ -49,4 +49,4 @@ def visualizza_batteria_da_json(path_file):
 
 if __name__ == "__main__":
     # Esempio di utilizzo
-    visualizza_batteria_da_json("fullOutput.json")
+    visualizza_batteria_da_json("fullOutput_4.json")
