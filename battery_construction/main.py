@@ -132,7 +132,6 @@ def elabora_dati(input_file_path):
             zipf.write(variant["json"], arcname=os.path.basename(variant["json"]))
             zipf.write(variant["glb"], arcname=os.path.basename(variant["glb"]))
 
-    return FileResponse("output_varianti.zip", media_type='application/zip', filename="output_package.zip")
 
 
 # comando per avviare il server locale:
@@ -144,19 +143,28 @@ async def process_files(file: UploadFile = File(...)):
     input_file_path = "input.json"
     output_json_path = "fullOutput.json"
     output_glb_path = "battery3D.glb"
-    zip_path = "output.zip"
+    zip_path = "output_varianti.zip"
 
     # Salva il file JSON ricevuto
     with open(input_file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Elabora i dati (questa funzione genera anche il file .glb e .json)
+    # Elabora i dati e li comprime(questa funzione genera anche il file .glb e .json)
     elabora_dati(input_file_path)
 
-    # Comprimiamo i due file da restituire in un .zip
-    with zipfile.ZipFile(zip_path, 'w') as zipf:
-        zipf.write(output_json_path, arcname="output.json")
+    # Comprime tutti i full_output_{i}.json generati
+    #with zipfile.ZipFile(zip_path, 'w') as zipf:
+    #    for filename in os.listdir("."):
+    #        if filename.startswith("full_output_") and filename.endswith(".json"):
+    #            zipf.write(filename, arcname=filename)
+
+
+
+
+        #with zipfile.ZipFile(zip_path, 'w') as zipf:
+        #zipf.write(output_json_path, arcname="output.json")
         #zipf.write(output_glb_path, arcname="model.glb")
 
-    return FileResponse(zip_path, media_type='application/zip', filename="output_package.zip")
+    print(f"📦 Inviando file ZIP: {zip_path}")
+    return FileResponse(path=os.path.abspath(zip_path), media_type='application/zip', filename="output_varianti.zip")
 
