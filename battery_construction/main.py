@@ -22,6 +22,7 @@ polygon_with_circles_file_path = os.path.join(BASE_DIR, "polygon_with_circles.js
 polygon_with_circles_and_connections_file_path = os.path.join(BASE_DIR, "polygon_with_circles_and_connections.json")
 battery3D_file_path = os.path.join(BASE_DIR, "battery3D.glb")
 model_battery_file_path = os.path.join(BASE_DIR, "model_battery.glb")
+celle_disponibili_file_path = os.path.join(BASE_DIR, "celle_disponibili.json")
 
 
 def elabora_dati(input_file_path):
@@ -45,23 +46,87 @@ def elabora_dati(input_file_path):
     circle_radius = battery_diameter / 2
     best_centers, best_angle = cp2.find_best_packing(poly, circle_radius)
     max_cells = len(best_centers)
+    print("⭕️ numero massimo di celle:", max_cells)
 
     # 3. Calcola le 5 migliori configurazioni
+    configurazioni_totali = []
+
+    # 1. Prova con i parametri originali
     configurazioni = fc.calcola_configurazioni_migliori(
-        cell_voltage, cell_current,
-        total_voltage, total_current,
+        cell_voltage, cell_current, total_voltage, total_current,
         celle_max=max_cells, top_k=5
     )
+    default_cell = {
+        "name": battery_type,
+        "diameter": battery_diameter,
+        "height": battery_height * 10,  # torna in mm
+        "voltage": cell_voltage,
+        "capacity": cell_current
+    }
+    if configurazioni:
+        print("✅ Configurazioni trovate con parametri originali.")
+        configurazioni_totali.extend([
+            (config, battery_diameter, battery_height, best_centers, default_cell)
+            for config in configurazioni
+        ])
 
+    # 2. Prova con riduzione capacità (cella attuale) e altre. celle
     if not configurazioni:
+        print("🔄 Provo riduzione capacità con cella originale...")
+        config_ridotta, nuova_capacita = fc.trova_configurazione_con_capacita_ridotta(
+            cell_voltage, cell_current, total_voltage, total_current, max_cells
+        )
+        if config_ridotta:
+            print(f"⚠️ Trovata configurazione con capacità ridotta a {nuova_capacita} Ah")
+            configurazioni_totali.extend([
+                (cfg, battery_diameter, battery_height, best_centers, default_cell)
+                for cfg in config_ridotta
+            ])
+
+        # 3. Prova celle alternative (sia originali che con capacità ridotta)
+        print("🔍 Provo celle alternative...")
+        with open(celle_disponibili_file_path, "r") as f:
+            celle_possibili = json.load(f)
+
+        for cell in celle_possibili:
+            diam = cell["diameter"]
+            h = cell["height"] / 10
+            r = diam / 2
+            centers_alt, _ = cp2.find_best_packing(poly, r)
+            celle_disponibili = len(centers_alt)
+
+            # A. Con capacità originale
+            config_alt = fc.calcola_configurazioni_migliori(
+                cell["voltage"], cell["capacity"], total_voltage, total_current,
+                celle_max=celle_disponibili, top_k=1        #seleziona una sola proposta per cella diversa
+            )
+            if config_alt:
+                configurazioni_totali.extend([
+                    (cfg, diam, h, centers_alt, cell)
+                    for cfg in config_alt
+                ])
+                continue  # salta capacità ridotta se già va bene
+
+            # B. Con capacità ridotta
+            config_ridotta, nuova_cap = fc.trova_configurazione_con_capacita_ridotta(
+                cell["voltage"], cell["capacity"], total_voltage, total_current, celle_disponibili
+            )
+            if config_ridotta:
+                configurazioni_totali.extend([
+                    (cfg, diam, h, centers_alt, cell)
+                    for cfg in config_ridotta
+                ])
+
+
+    if not configurazioni_totali:
         raise HTTPException(
             status_code=400,
-            detail="❌ Nessuna configurazione valida trovata. Rivedi i parametri della batteria o la forma del contenitore."
+            detail="❌ Nessuna configurazione possibile anche dopo riduzioni e cambi celle."
         )
 
     output_varianti = []
 
-    for i, config in enumerate(configurazioni):
+    for i, (config, battery_diameter, battery_height, best_centers, cell_info) in enumerate(configurazioni_totali):
         S = config["S"]
         P = config["P"]
         used_cells = S * P
@@ -70,7 +135,7 @@ def elabora_dati(input_file_path):
         export_data = {
             "polygon": vertices,
             "circles": [
-                {"center": [x, y], "radius": circle_radius} for x, y in best_centers
+                {"center": [x, y], "radius": cell_info["diameter"] / 2} for x, y in best_centers
             ]
         }
         layout_path = f"polygon_with_circles_{i}.json"
@@ -105,6 +170,13 @@ def elabora_dati(input_file_path):
         merged_data = {
             "timestamp": timestamp,
             "battery_parameters": battery_data,
+            "cell_used": {
+                "name": cell_info.get("type", "unknown"),
+                "diameter": cell_info["diameter"],
+                "height": cell_info["height"],
+                "voltage": cell_info["voltage"],
+                "capacity": cell_info["capacity"]
+            },
             "data_output": data_output,
             "layout_data": layout_data
         }

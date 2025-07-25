@@ -3,20 +3,10 @@ import numpy as np
 from collections import deque
 import networkx as nx
 
-def calcola_configurazione_batteria(v_cella, ah_cella, v_target, ah_target, celle_disponibili):
-    s = round(v_target / v_cella)
-    p = round(ah_target / ah_cella)
-    totale = s * p
 
-    #print(f"Configurazione suggerita: {s}S{p}P")
-    #print(f"Celle totali richieste: {totale}")
 
-    #if totale <= celle_disponibili:
-    #    print("✅ Le celle entrano nella forma disponibile.")
-    #else:
-    #    print("⚠️ Troppe celle. Considera di abbassare la capacità o cambiare disposizione.")
-    #return s, p, totale
-
+#Crea un grafo non orientato dove ogni nodo è una cella e viene aggiunto un arco tra
+#due celle se la loro distanza è minore o uduale alla distanza massima
 def costruisci_grafo_adiacenza(centers, distanza_massima):
     G = nx.Graph()
     for i, c1 in enumerate(centers):
@@ -28,6 +18,13 @@ def costruisci_grafo_adiacenza(centers, distanza_massima):
                 G.add_edge(i, j)
     return G
 
+
+
+
+
+#trova tutte le componenti connesse del grafo G
+#Per ogni comopnenete analizza i singoli nodi della componente
+# Se non è stato gia segnata come usata esegue una bfs per travare un gruppo da P celle adiacenti
 def estrai_gruppi_connessi(G, S, P):
     gruppi = []
     usate = set()
@@ -61,6 +58,12 @@ def estrai_gruppi_connessi(G, S, P):
                     return gruppi
     raise ValueError(f"Impossibile formare {S} gruppi di {P} celle adiacenti.")
 
+
+
+
+
+# varia il raggio di connesisone massimo da usare . Per ogni calore costruisce un grafo di adiacenza 
+# e prova a estrarre i gruppi. Se non riesce aumenta il raggio e riprova.
 def trova_gruppi_con_raggio_adattivo(centers, radius, S, P, raggio_iniziale=2.0, raggio_massimo=6.0, passo=0.5):
     for moltiplicatore in np.arange(raggio_iniziale, raggio_massimo + passo, passo):
         distanza = moltiplicatore * radius
@@ -70,9 +73,9 @@ def trova_gruppi_con_raggio_adattivo(centers, radius, S, P, raggio_iniziale=2.0,
         gruppi = estrai_gruppi_connessi(G, S, P)
             #print(f"✅ Gruppi trovati con distanza {distanza:.2f}")
         return gruppi
-        #except ValueError as e:
-            #print(f"❌ {e}")
-    #raise ValueError(f"Impossibile formare {S} gruppi di {P} celle adiacenti anche aumentando il raggio.")
+    
+
+
 
 
 def calcola_centroidi_gruppi(centers, gruppi):
@@ -82,6 +85,11 @@ def calcola_centroidi_gruppi(centers, gruppi):
         centroid = coords.mean(axis=0)
         centroidi.append(centroid.tolist())
     return centroidi
+
+
+
+
+
 
 def crea_collegamenti_serie_ottimizzati(gruppi, centers, radius):
     # Costruisci il grafo dei gruppi
@@ -127,6 +135,10 @@ def crea_collegamenti_serie_ottimizzati(gruppi, centers, radius):
 
     return connessioni
 
+
+
+
+
 def conta_celle_adiacenti(gruppo1, gruppo2, centers, soglia_distanza):
     count = 0
     for i in gruppo1:
@@ -136,46 +148,4 @@ def conta_celle_adiacenti(gruppo1, gruppo2, centers, soglia_distanza):
                 count += 1
     return count
 
-if __name__ == "__main__":
-    # 1. Calcola configurazione
-    S, P, total = calcola_configurazione_batteria(
-        v_cella=3.6,
-        ah_cella=2.5,
-        v_target=47,
-        ah_target=22,
-        celle_disponibili=125
-    )
 
-    # 2. Carica dati originali
-    with open("polygon_with_circles.json", "r") as f:
-        data = json.load(f)
-    
-    polygon = data["polygon"]
-    circles = data["circles"]
-    radius = circles[0]["radius"]
-    centers = [tuple(c["center"]) for c in circles]
-
-    # 3. Trova gruppi
-    gruppi = trova_gruppi_con_raggio_adattivo(centers, radius, S, P)
-
-    # 4. Calcola centroidi e collegamenti
-    centroidi = calcola_centroidi_gruppi(centers, gruppi)
-    connessioni = crea_collegamenti_serie_ottimizzati(gruppi,centers,radius)
-
-    # 5. Salva nuovo file con connessioni
-    data_output = {
-        "polygon": polygon,
-        "circles": circles,
-        "gruppi": gruppi,
-        "serie_connections": connessioni
-    }
-
-    with open("polygon_with_circles_and_connections.json", "w") as f:
-        json.dump(data_output, f, indent=2)
-
-    #print("✅ File salvato: polygon_with_circles_and_connections.json")
-
-    # 6. Visualizza il file salvato
-    #with open("polygon_with_circles_and_connections.json", "r") as f:
-    #    data_loaded = json.load(f)
-    #plot_batteria_con_collegamenti(data_loaded, radius)
