@@ -146,14 +146,16 @@ def elabora_dati(input_file_path):
             data = json.load(f)
 
         centers = [tuple(c["center"]) for c in data["circles"]]
-        radius = data["circles"][0]["radius"] * 4
+        radius = data["circles"][0]["radius"]
         gruppi = ap.trova_gruppi_con_raggio_adattivo(centers, radius, S, P)
+        gruppi_verificati = ap.verifica_gruppi_connessi(gruppi, centers, distanza_verifica=2.0 * radius)
+        gruppi_finali = ap.riassegna_gruppi_piccoli(gruppi_verificati, centers, P, distanza_massima=2.0 * radius)
         connessioni = ap.crea_collegamenti_serie_ottimizzati(gruppi, centers, radius)
 
         layout_data = {
             "polygon": data["polygon"],
             "circles": data["circles"],
-            "gruppi": gruppi,
+            "gruppi": gruppi_finali,
             "serie_connections": connessioni
         }
 

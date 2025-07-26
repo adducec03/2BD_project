@@ -31,7 +31,6 @@ def estrai_gruppi_connessi(G, S, P):
 
     for componente in nx.connected_components(G):
         nodi = list(componente)
-        subG = G.subgraph(nodi)
 
         for nodo in nodi:
             if nodo in usate:
@@ -64,16 +63,67 @@ def estrai_gruppi_connessi(G, S, P):
 
 # varia il raggio di connesisone massimo da usare . Per ogni calore costruisce un grafo di adiacenza 
 # e prova a estrarre i gruppi. Se non riesce aumenta il raggio e riprova.
-def trova_gruppi_con_raggio_adattivo(centers, radius, S, P, raggio_iniziale=2.0, raggio_massimo=6.0, passo=0.5):
+def trova_gruppi_con_raggio_adattivo(centers, radius, S, P, raggio_iniziale=2.0, raggio_massimo=20.0, passo=0.5):
     for moltiplicatore in np.arange(raggio_iniziale, raggio_massimo + passo, passo):
         distanza = moltiplicatore * radius
         #print(f"Tentativo con distanza massima: {distanza:.2f}")
         G = costruisci_grafo_adiacenza(centers, distanza)
-        #try:
-        gruppi = estrai_gruppi_connessi(G, S, P)
-            #print(f"✅ Gruppi trovati con distanza {distanza:.2f}")
-        return gruppi
+        try:
+            gruppi = estrai_gruppi_connessi(G, S, P)
+            print(f"✅ Gruppi trovati con distanza {distanza:.2f}")
+            return gruppi
+        except ValueError:
+            continue
     
+
+def verifica_gruppi_connessi(gruppi, centers, distanza_verifica):
+    nuovi_gruppi = []
+    for gruppo in gruppi:
+        G = nx.Graph()
+        for i in gruppo:
+            G.add_node(i)
+        for i in gruppo:
+            for j in gruppo:
+                if i < j:
+                    dist = np.linalg.norm(np.array(centers[i]) - np.array(centers[j]))
+                    if dist <= distanza_verifica:
+                        G.add_edge(i, j)
+        componenti = list(nx.connected_components(G))
+
+        if len(componenti) > 1:
+            print(f"⚠️ Gruppo spezzato: {len(componenti)} componenti")
+
+        for comp in componenti:
+            nuovi_gruppi.append(list(comp))
+    return nuovi_gruppi
+
+
+
+def riassegna_gruppi_piccoli(gruppi, centers, P, distanza_massima):
+    gruppi_finali = []
+    buffer = []
+
+    for gruppo in gruppi:
+        if len(gruppo) == P:
+            gruppi_finali.append(gruppo)
+        else:
+            buffer.append(gruppo)
+
+    for piccolo in buffer:
+        centro_piccolo = np.mean([centers[i] for i in piccolo], axis=0)
+        min_dist = float('inf')
+        gruppo_target = None
+        for g in gruppi_finali:
+            if len(g) >= P:
+                continue
+            centro_g = np.mean([centers[i] for i in g], axis=0)
+            dist = np.linalg.norm(centro_piccolo - centro_g)
+            if dist < min_dist:
+                min_dist = dist
+                gruppo_target = g
+        if gruppo_target and len(gruppo_target) + len(piccolo) <= P:
+            gruppo_target.extend(piccolo)
+    return gruppi_finali
 
 
 
