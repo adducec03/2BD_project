@@ -150,6 +150,10 @@ def crea_collegamenti_serie_ottimizzati(gruppi, centers, radius):
     centroidi = calcola_centroidi_gruppi(centers, gruppi)
     
     # Crea archi tra gruppi con polarità opposte e molte celle adiacenti
+
+    for i in range(num_gruppi):
+        G.add_node(i)
+
     for i in range(num_gruppi):
         for j in range(i + 1, num_gruppi):
             if polarita[i] == polarita[j]:
