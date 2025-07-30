@@ -8,6 +8,7 @@ import math
 import numpy as np
 import networkx as nx               # pip install networkx
 from pathlib import Path
+import matplotlib as mpl
 import matplotlib.cm as cm        # colour maps
 import matplotlib.pyplot as plt
 import heapq, random
@@ -18,8 +19,23 @@ import circle_packing as cp
 
 R   = 9.0          # mm cell radius
 EPS = 0.2          # slack in adjacency threshold
-S = 15
-P = 19
+S =42
+P = 10
+
+# -------------------------------------------------------------
+# Configurations to try for test purposes
+# 43S11P
+# 29S16P
+# 59S8P
+# 18S18P
+# 54S6P
+# 10S30P
+# 78S4P
+# 8S8P
+# 59S8P
+# 34S14P
+# -------------------------------------------------------------
+
 
 
 
@@ -28,29 +44,100 @@ P = 19
 # -------------------------------------------------------------
 
 
-def plot_groups(poly, centres, part_dict, k, title="k-way grouping"):
-    """poly  : Shapely Polygon   (battery outline)
-       centres : (N,2) ndarray   (circle centres)
-       part_dict : {node_id : group_id}
-       k        : number of groups (for colouring)
-    """
-    fig, ax = plt.subplots(figsize=(6,6))
-
-    # outline
+def plot_groups(poly, centres, part_of, S, group_color=None, title="k-way grouping"):
+    fig, ax = plt.subplots(figsize=(7,7))
+    # boundary
     ax.plot(*poly.exterior.xy, color='k', lw=2)
 
-    # choose a colour map with enough visually distinct hues
-    cmap = cm.get_cmap('tab20', k)      # tab20 has up to 20 discrete colours
+    # if caller did not compute colors, fall back to palette only
+    if group_color is None:
+        palette = make_big_palette(S)
+        group_color = {g: palette[g % len(palette)] for g in range(S)}
 
-    for idx, (x,y) in enumerate(centres):
-        gid = part_dict[idx]            # 0…k-1
-        ax.add_patch(plt.Circle((x,y), R,
-                    facecolor=cmap(gid), edgecolor='k', lw=0.4))
+    # draw circles
+    for idx, (x, y) in enumerate(centres):
+        gid = part_of[idx] if isinstance(part_of, dict) else part_of[idx]
+        col = group_color[gid]
+        ax.add_patch(plt.Circle((x, y), R, facecolor=col, edgecolor='k', lw=0.4))
+
+    # optional: put group labels at the group centroid
+    for g in range(S):
+        members = [i for i,p in part_of.items()] if isinstance(part_of, dict) else list(range(len(part_of)))
+        members = [i for i in members if (part_of[i] if isinstance(part_of, dict) else part_of[i]) == g]
+        if members:
+            cx, cy = centres[members].mean(axis=0)
+            ax.text(cx, cy, str(g), ha='center', va='center',
+                    fontsize=7, color='black', weight='bold',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='white', alpha=0.5))
 
     ax.set_aspect('equal')
-    ax.set_title(f"{title}   (k = {k})")
+    ax.set_title(f"{title} (S={S})")
     ax.axis('off')
+    plt.tight_layout()
     plt.show()
+
+
+def make_big_palette(n: int, seed: int|None = None):
+    # 1) best: colorcet glasbey (if installed)
+    try:
+        import colorcet as cc  # pip install colorcet
+        base = list(cc.glasbey)   # ~256 very distinct colors
+        if n <= len(base):
+            return [mpl.colors.to_rgb(c) for c in base[:n]]
+        else:
+            # fallback to HSV if you need more
+            pass
+    except Exception:
+        pass
+
+    # 2) very good: seaborn
+    try:
+        import seaborn as sns  # pip install seaborn
+        return sns.color_palette("husl", n)  # or: "hls"
+    except Exception:
+        pass
+
+    # 3) fallback: HSV evenly spaced
+    rng = np.random.default_rng(seed)
+    hues = np.linspace(0, 1, n, endpoint=False)
+    # fixed saturation/value to ensure good contrast
+    return [mpl.colors.hsv_to_rgb((h, 0.65, 0.95)) for h in hues]
+
+from networkx.algorithms.coloring import greedy_color
+
+def color_groups_avoiding_adjacent(G: nx.Graph, part_of: dict[int,int], S: int,
+                                   palette=None, strategy="saturation_largest_first"):
+    """
+    Returns: dict {group_id -> RGB tuple} such that adjacent groups have different colors.
+    """
+    H = build_group_adjacency_graph(G, part_of, S)
+    # Greedy coloring of the *group* graph
+    col_idx = greedy_color(H, strategy=strategy)
+    ncols   = max(col_idx.values()) + 1
+
+    # If no palette provided, build one with at least ncols colors
+    if palette is None or len(palette) < ncols:
+        palette = make_big_palette(ncols)
+
+    # Map each group to its color
+    group_color = {g: palette[col_idx[g]] for g in range(S)}
+    return group_color
+
+
+def build_group_adjacency_graph(G: nx.Graph, part_of: dict[int,int], S: int) -> nx.Graph:
+    """
+    G       : contact graph (nodes = cells)
+    part_of : dict {node_id -> group_id}
+    S       : number of groups
+    Returns: group adjacency graph H with node-set {0..S-1}
+    """
+    H = nx.Graph()
+    H.add_nodes_from(range(S))
+    for u, v in G.edges:
+        gu, gv = part_of[u], part_of[v]
+        if gu != gv:
+            H.add_edge(gu, gv)
+    return H
 
 # ----------------------------------------------------------------------
 def load_centres(csv_path: Path) -> np.ndarray:
@@ -483,7 +570,74 @@ def geodesic_capacity_partition(G: nx.Graph, S: int, P: int,
     return assign
 
 # ----------------------------------------------------------------------
+def rb_exact_partition(G: nx.Graph, groups: list[int], P: int) -> dict[int,int]:
+    """
+    Recursively bisect the vertex set 'groups' into len(groups)/P leaves of size P.
+    Returns part_of (vertex -> group_id) with exact sizes and high contiguity.
+    """
+    # groups is the list of vertices of a current subproblem
+    n = len(groups)
+    S_here = n // P
+    if S_here == 1:
+        # one leaf ⇒ assign all to the same group id
+        gid = rb_exact_partition.gid_counter
+        rb_exact_partition.gid_counter += 1
+        return {v: gid for v in groups}
 
+    # choose how many parts go left/right (balance by size in multiples of P)
+    S_left = S_here // 2
+    S_right = S_here - S_left
+    target_left = S_left * P
+    target_right = S_right * P
+
+    # Build local CSR for the induced subgraph
+    idx = {v:i for i,v in enumerate(groups)}
+    xadj, adjncy, eweights = [0], [], []
+    for v in groups:
+        for nb, data in G[v].items():
+            if nb in idx:
+                adjncy.append(idx[nb])
+                w = data.get('weight', 1.0)
+                eweights.append(int(w*10000))
+        xadj.append(len(adjncy))
+
+    vweights = [1]*n
+    tpwgts   = [target_left/float(n), target_right/float(n)]
+
+    # 2-way bisection with targets
+    _, parts2 = pymetis.part_graph(
+        2, xadj=xadj, adjncy=adjncy, eweights=eweights,
+        vweights=vweights, tpwgts=tpwgts, recursive=True, contiguous=True
+    )
+    left  = [groups[i] for i,p in enumerate(parts2) if p==0]
+    right = [groups[i] for i,p in enumerate(parts2) if p==1]
+
+    # Minor corrections if one side is ±1 from target due to rounding
+    # (usually unnecessary when vweights=1 and tpwgts are multiples of 1/n)
+    if len(left) != target_left:
+        # move boundary vertices to correct exact sizes (1-2 moves)
+        # choose vertices adjacent across the cut to minimise damage
+        need = target_left - len(left)
+        if need > 0:
+            # move 'need' vertices from right to left
+            border_candidates = [v for v in right if any(u in left for u in G[v])]
+            move = border_candidates[:need] if len(border_candidates)>=need else right[:need]
+            left += move
+            right = [v for v in right if v not in move]
+        elif need < 0:
+            need = -need
+            border_candidates = [v for v in left if any(u in right for u in G[v])]
+            move = border_candidates[:need] if len(border_candidates)>=need else left[:need]
+            right += move
+            left = [v for v in left if v not in move]
+
+    # recurse
+    L = rb_exact_partition(G, left, P)
+    R = rb_exact_partition(G, right, P)
+    return {**L, **R}
+
+# static counter for new group ids
+rb_exact_partition.gid_counter = 0
 
 
 # ----------------------------------------------------------------------
@@ -500,20 +654,25 @@ def main():
 
     # -------------------------------------------------------------------
     G   = build_contact_graph(centres)        # only those kept cells
-    parts = metis_k_partition(G, S)           # S balanced parts
+    #parts = metis_k_partition(G, S)           # S balanced parts
     #parts = geodesic_capacity_partition(G, S, P)
     #part_of = metis_connected_parts(G, S, P)   # healing on top of METIS
 
     # parts is a list (len = S*P).  Convert to dict {node_id: group_id}
     #part_dict = {i:part_of[i] for i in range(len(part_of))}
+    rb_exact_partition.gid_counter = 0
+    part_of = rb_exact_partition(G, list(G.nodes()), P)
+
+    group_color = color_groups_avoiding_adjacent(G, part_of, S)
+
 
     # ----- Sanity check -------------------------------------------------
-    group_sizes = [parts.count(g) for g in range(S)]
+    #group_sizes = [parts.count(g) for g in range(S)]
     #group_sizes = [list(part_of.values()).count(g) for g in range(S)]
-    print("Group sizes:", group_sizes)        # should all be P
+    #print("Group sizes:", group_sizes)        # should all be P
 
     # ----- PLOT ---------------------------------------------------------
-    plot_groups(poly, centres, parts, S)
+    plot_groups(poly, centres, part_of, S, group_color=group_color, title=f"S={S}, P={P} (adjacency-colored)")
 # ----------------------------------------------------------------------
 
 if __name__ == "__main__":
