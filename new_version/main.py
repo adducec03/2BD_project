@@ -1,20 +1,32 @@
 import circle_packing as cp
 import starting_k_grouping as kg
 import series_ordering as so
+import parallel_plate as pp
+import series_plate as sp
+
+
 from pathlib import Path
 from shapely.geometry import Point, Polygon, LineString
 import numpy as np
 import networkx as nx
+import matplotlib.pyplot as plt
+
+
 
 
 if __name__ == "__main__":
+
+
+    ###########################################################
+                            #Variables
+    ###########################################################
 
     json_file = "new_version/input.json"  # Path to the input JSON file
     out_csv = "new_version/out.csv"
     R = 9.0  # mm, radius of an 18650 seen from the top
     EPS = 0.2          # slack in adjacency threshold
-    S = 30
-    P = 10
+    S = 10
+    P = 59
 
 
 
@@ -24,7 +36,7 @@ if __name__ == "__main__":
 
 
     ###########################################################
-    #Circle Packing
+                        #Circle Packing
     #This module is used to pack the cells in a polygonal shape.
     ###########################################################
 
@@ -88,7 +100,7 @@ if __name__ == "__main__":
 
 
     ###########################################################
-    #K_grouping
+                    #K_grouping
     #This module is used to group the cells in k groups.
     ###########################################################
 
@@ -120,7 +132,7 @@ if __name__ == "__main__":
     #print("Group sizes:", group_sizes)        # should all be P
 
     # ----- PLOT ---------------------------------------------------------
-    #kg.plot_groups(poly, centres, part_of, S, group_color=group_color, title=f"S={S}, P={P} (adjacency-colored)")
+    kg.plot_groups(poly, centres, part_of, S, group_color=group_color, title=f"S={S}, P={P} (adjacency-colored)")
     # ----------------------------------------------------------------------
 
 
@@ -130,7 +142,7 @@ if __name__ == "__main__":
 
 
     ###########################################################
-    #Series Ordering
+                    #Series Ordering
     #This module is used to order the groups in series.
     ###########################################################
 
@@ -151,4 +163,56 @@ if __name__ == "__main__":
     # Plot
     group_color = kg.color_groups_avoiding_adjacent(G, part_of, S)
     so.plot_series_order(poly, centres, part_of, S, order, R=R)
+
+
+
+
+
+
+
+
+
+
+
+    ##########################################################################
+                                #Plates design
+    #This module is used to design plates for parallel and series connections.
+    ##########################################################################
+
+    #-----------------------------------Parallel------------------------------
+    plates = pp.make_all_plates(G, centres, part_of, S,
+                                R=R, land=1.2, gap=2.0, outline=poly, res=64)
+    plates = {g: pp.smooth_plate(poly, r_open=3, r_close=1, gap=2.0, safety=0.10)
+          for g, poly in plates.items()}
+    #plate = npb.smooth_plate(plates, r_open=0.8, r_close=0.4, gap=2.0, safety=0.10)
+    welds  = pp.weld_points_all(G, centres, part_of, S, R=R, offset=2.6)
+    # Plot
+    pp.plot_plates(poly, centres, part_of, S, plates, welds, R=R,
+                title=f"Nickel plates per group (S={S}, P={P}) – disjoint")
+
+
+    #-----------------------------------Series--------------------------------
+    # known:
+    #   plates : dict {group -> shapely Polygon}  (parallel plates, disjoint)
+    #   part_of, centres, S
+    #   order  : list of group-ids from OR-Tools path
+    #   I_pack : (estimated) peak pack current
+
+    group_edges = [(order[i], order[i+1]) for i in range(len(order)-1)]
+
+
+    bridges = sp.make_series_band_from_cells(
+        G, centres, part_of, group_edges,
+        R=9.0,
+        rows=1,        # try 2–3 to match your photo (more rows ⇒ wider plate)
+        inset=0.6,
+        smooth=1.0,
+        clip_poly=poly
+    )
+
+    sp.plot_series_plates_over_cells(poly, centres, part_of, S, bridges, R=9.0)
+
+
+    
+
 
