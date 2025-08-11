@@ -25,13 +25,19 @@ from pathlib import Path
 
 import numpy as np
 import math
-from shapely.geometry import Point, Polygon, LineString
+from shapely.geometry import Point, Polygon, LineString, MultiPolygon
 from shapely.prepared import prep
 from shapely.ops import unary_union
 from shapely.affinity import rotate
 from shapely import maximum_inscribed_circle
 import pyswarms as ps
 import matplotlib.pyplot as plt
+from matplotlib.patches import Polygon as MplPolygon
+from time import perf_counter
+
+
+R = 15.0  # mm, radius of an 18650 seen from the top
+
 
 ##############################################################################
 # ------------- 0. Parse command-line & input JSON --------------------------
@@ -51,7 +57,114 @@ def load_boundary(json_path: Path):
 # ------------- 1. Geometry helpers & feasibility checks --------------------
 ##############################################################################
 
-R = 9.0  # mm, radius of an 18650 seen from the top
+def residual_free_space(poly, centres, R=9.0, res=64):
+    """
+    Physical free space inside the polygon once the R-disks are carved out:
+        ℛ = poly \ ∪ B(ci, R)
+    """
+    if len(centres) == 0:
+        return poly
+    discs = [Point(x, y).buffer(R, resolution=res) for x, y in centres]
+    hull  = unary_union(discs)
+    return poly.difference(hull)
+
+
+def feasible_centre_region(poly: Polygon, centres: np.ndarray, R: float):
+    """Admissible locations for a *new centre* (distance ≥R from boundary
+       and ≥2R from existing centres).  Useful to report 'free area'."""
+    inner = poly.buffer(-R).buffer(0)
+    if inner.is_empty:
+        return inner
+    if len(centres):
+        discs2R = [Point(x, y).buffer(2.0*R) for x, y in centres]
+        forbidden = unary_union(discs2R)
+        region = inner.difference(forbidden)
+    else:
+        region = inner
+    return region.buffer(0)
+
+def _clearance(poly: Polygon, centres: np.ndarray, R: float, pt: Point) -> float:
+    """r(pt) = min(dist to true polygon boundary, dist to any cell surface)."""
+    d_wall = pt.distance(poly.boundary)
+    if len(centres):
+        C = np.asarray(centres)
+        dx = C[:,0] - pt.x
+        dy = C[:,1] - pt.y
+        d_cells = np.sqrt(dx*dx + dy*dy).min() - R
+    else:
+        d_cells = float('inf')
+    return max(0.0, min(d_wall, d_cells))
+
+def _hill_climb(seed: Point, step0: float, region: Polygon, f, tol=1e-3, itmax=80):
+    p = Point(seed.x, seed.y)
+    r = f(p)
+    step = step0
+    dirs = [(1,0),(-1,0),(0,1),(0,-1),(1,1),(1,-1),(-1,1),(-1,-1)]
+    for _ in range(itmax):
+        improved = False
+        for dx, dy in dirs:
+            q = Point(p.x + dx*step, p.y + dy*step)
+            if region.contains(q):
+                rq = f(q)
+                if rq > r:
+                    p, r = q, rq
+                    improved = True
+        if not improved:
+            step *= 0.5
+            if step < tol:
+                break
+    return r, p
+
+def largest_clearance_circle(poly: Polygon, centres: np.ndarray, R: float,
+                             grid_density=220, seeds_per_component=6):
+    """
+    Global search:
+      – If feasible-centre region F = poly.buffer(-R) is non-empty:
+          search in every connected component of F.
+      – Else (no admissible centre): fall back to searching in the whole polygon.
+
+    Returns (radius_mm, centre_point).
+    """
+    F = poly.buffer(-R).buffer(0)
+    search_geom = F if not F.is_empty else poly
+
+    # Prepare list of components to visit
+    comps = [search_geom] if search_geom.geom_type == "Polygon" else list(search_geom.geoms)
+
+    best_r, best_p = 0.0, None
+
+    # closure: clearance uses the *true polygon* and the cells
+    def f(pt: Point): return _clearance(poly, centres, R, pt)
+
+    for comp in comps:
+        minx, miny, maxx, maxy = comp.bounds
+        L = max(maxx - minx, maxy - miny)
+        # grid spacing: denser of {L/ grid_density, R/3}
+        step = max(L / float(grid_density), R / 3.0)
+        xs = np.arange(minx, maxx + step, step)
+        ys = np.arange(miny, maxy + step, step)
+
+        # coarse scan to pick seeds
+        cand = []
+        for y in ys:
+            for x in xs:
+                p = Point(x, y)
+                if comp.contains(p):
+                    cand.append((f(p), p))
+        if not cand:
+            continue
+        cand.sort(key=lambda t: t[0], reverse=True)
+        seeds = [p for _, p in cand[:max(3, seeds_per_component)]]
+        # always add the representative point (inside component)
+        seeds.append(comp.representative_point())
+
+        # refine each seed
+        for p0 in seeds:
+            r0, p_star = _hill_climb(p0, step, comp, f)
+            if r0 > best_r:
+                best_r, best_p = r0, p_star
+
+    return best_r, best_p
 
 def circle_fits(prep_poly, poly, x, y, r=R) -> bool:
     """True if the closed disk radius r centred at (x,y) is wholly inside."""
@@ -69,6 +182,115 @@ def plot_layout(poly, centres, r=R, title="Layout"):
     ax.set_title(f"{title} ({len(centres)} cells)")
     plt.show()
 
+
+def largest_empty_circle_on_region(region):
+    """Return (radius_mm, centre_point) for LEC inside 'region'."""
+    if region.is_empty:
+        return 0.0, None
+    circ = maximum_inscribed_circle(region)
+    if circ.geom_type == "Polygon":
+        r = math.sqrt(circ.area / math.pi)
+        c = circ.centroid
+    elif circ.geom_type == "Point":
+        r, c = 0.0, circ
+    else:  # LineString (slit): radius = half width
+        r, c = circ.length / 2.0, circ.interpolate(0.5, normalized=True)
+    return r, c
+
+
+def _draw_polygon(ax, geom, **kw):
+    """Draw Polygon or MultiPolygon boundary to the axes."""
+    if isinstance(geom, (Polygon)):
+        x, y = geom.exterior.xy
+        ax.plot(x, y, **kw)
+    elif isinstance(geom, (MultiPolygon,)):
+        for g in geom.geoms:
+            x, y = g.exterior.xy
+            ax.plot(x, y, **kw)
+
+def add_shapely_patch(ax, geom, facecolor=(0,1,0,0.7), edgecolor="#00000087",
+                      zorder=0):
+    """
+    Draw a (Multi)Polygon 'geom' as one or more Matplotlib patches.
+    Handles holes by drawing them as white-filled polygons on top.
+    """
+    if geom.is_empty:
+        return
+    if geom.geom_type == 'Polygon':
+        ext = np.asarray(geom.exterior.coords)
+        ax.add_patch(MplPolygon(ext, closed=True, facecolor=facecolor,
+                                edgecolor=edgecolor, zorder=zorder))
+        # holes
+        for ring in geom.interiors:
+            hole = np.asarray(ring.coords)
+            ax.add_patch(MplPolygon(hole, closed=True, facecolor='white',
+                                    edgecolor='none', zorder=zorder+0.01))
+    elif geom.geom_type == 'MultiPolygon':
+        for g in geom.geoms:
+            add_shapely_patch(ax, g, facecolor=facecolor,
+                              edgecolor=edgecolor, zorder=zorder)
+
+def plot_phase(poly, centres, added_idx=None, title="",
+               r=9.0, time_s=None,
+               color_all="#377eb8",    # blue
+               color_added="#e41a1c",  # red
+               edgecolor="k",
+               show_residual=True, show_lec=True,
+               show_feasible=True, feasible_fc=(0,1,0,0.18)):
+    """
+    As before, plus:
+      show_feasible : draw feasible centre region (poly eroded by r minus 2r-disks)
+      feasible_fc   : RGBA of the green fill, default ~18% opaque.
+    """
+    fig, ax = plt.subplots(figsize=(6,6))
+
+    # (optional) draw feasible region first (so cells are on top)
+    if show_feasible:
+        F = feasible_centre_region(poly, centres, r)
+        add_shapely_patch(ax, F, facecolor=feasible_fc, edgecolor='none', zorder=0)
+
+    # boundary on top of the green fill
+    ax.plot(*poly.exterior.xy, lw=2, color='k', zorder=2)
+
+    # residual+LEC for info box (unchanged)
+    free_area = None; lec_rad = None; lec_diam = None; lec_c = None
+    if show_residual or show_lec:
+        # Free area to report is the feasible region area
+        F = feasible_centre_region(poly, centres, r)
+        free_area = F.area
+        # LEC centre must be admissible, circle touches true polygon/cells
+        lec_rad, lec_c = largest_clearance_circle(poly, centres, r)
+        lec_diam = 2*lec_rad if lec_rad else 0.0
+
+    # plot cells
+    added_idx = np.array(added_idx) if added_idx is not None else np.array([], int)
+    added_set = set(added_idx.tolist())
+    for i, (x, y) in enumerate(centres):
+        fc = color_added if i in added_set else color_all
+        ax.add_patch(plt.Circle((x, y), r, facecolor=fc, edgecolor=edgecolor,
+                                lw=0.5, alpha=0.9, zorder=3))
+
+    # draw LEC
+    if show_lec and lec_rad and lec_c is not None and lec_rad > 0.0:
+        ax.add_patch(plt.Circle((lec_c.x, lec_c.y), lec_rad,
+                                fill=False, edgecolor='green', lw=1.5,
+                                linestyle='--', zorder=4))
+        ax.plot(lec_c.x, lec_c.y, 'g+', ms=10, mew=2, zorder=4)
+
+    # info box
+    info = (f"Total = {len(centres)}"
+            f"\nAdded this phase = {len(added_idx)}"
+            + (f"\nTime = {time_s:.3f} s" if time_s is not None else "")
+            + (f"\nFree area = {free_area:.1f} mm²" if free_area is not None else "")
+            + (f"\nLEC radius = {lec_rad:.2f} mm\nLEC diameter = {lec_diam:.2f} mm"
+               if lec_rad is not None else ""))
+    ax.text(0.02, 0.98, info, transform=ax.transAxes, ha='left', va='top',
+            fontsize=10, bbox=dict(boxstyle='round,pad=0.4',
+            fc='white', ec='0.3', alpha=0.9), zorder=5)
+
+    ax.set_aspect('equal'); ax.axis('off')
+    ax.set_title(title)
+    plt.tight_layout(); plt.show()
 
 ##############################################################################
 # ------------- 2. Hexagonal grid seeding -----------------------------------
@@ -403,31 +625,50 @@ def largest_empty_circle(pocket):
     
 
 def main(json_file: str, out_csv="centres.csv"):
-    # --------------------------------------------------- load outline ----
-    poly, _ = load_boundary(Path(json_file))
+    # 0) Load boundary
+    poly, _ = load_boundary(Path(json_file))  # your JSON path
 
-    # 1 ─ aligned hex grid (finer phase scan gives 1-3 extra cells)
+    # 1) Hex grid
+    t0 = perf_counter()
     centres = best_hex_seed_two_angles(poly, n_phase=16)
-    print("hex grid :", len(centres))
+    t1 = perf_counter()
+    plot_phase(poly, centres, added_idx=np.arange(len(centres)),
+            title="After hex grid", r=R, time_s=t1 - t0)
 
-    # pso refine (deleted for now, see below)
-    #centres1 = pso_refine(centres0, poly)
-    #print("PSO done")
-
-    # 2 ─ first greedy insertion (fills obvious edge gaps)
+    # 2) First greedy
+    prev = len(centres)
+    t0 = perf_counter()
     centres = greedy_insert(poly, centres, trials=1000, max_pass=6)
-    print("after greedy :", len(centres))
+    t1 = perf_counter()
+    plot_phase(poly, centres, added_idx=np.arange(prev, len(centres)),
+            title="After first greedy", r=R, time_s=t1 - t0)
 
-    # 3 ─ local compaction (Python re-implementation of Zhou’s batch-BFGS)
+    # 3) Local compaction (no new cells)
+    t0 = perf_counter()
     centres = batch_bfgs_compact(centres, R, poly, n_pass=4)
-    print("after compaction :", len(centres))
+    t1 = perf_counter()
+    plot_phase(poly, centres, added_idx=[],
+            title="After compaction", r=R, time_s=t1 - t0)
 
-    # 4 ─ second greedy pass (micron pockets now opened by compactor)
-    centres = greedy_insert(poly, centres, trials=1000, max_pass=3)
-    print("final count :", len(centres))
+    # 4) Second greedy
+    prev = len(centres)
+    t0 = perf_counter()
+    centres = greedy_insert(poly, centres, trials=500, max_pass=3)
+    t1 = perf_counter()
+    plot_phase(poly, centres, added_idx=np.arange(prev, len(centres)),
+            title="After second greedy", r=R, time_s=t1 - t0)
 
+    # 5) Skeleton insert
+    prev = len(centres)
+    t0 = perf_counter()
     centres = skeleton_insert(poly, centres, step=2.0)
-    print("after skeleton :", len(centres))
+    t1 = perf_counter()
+    plot_phase(poly, centres, added_idx=np.arange(prev, len(centres)),
+            title="After skeleton insert", r=R, time_s=t1 - t0)
+
+    # Optional: Save final CSV
+    np.savetxt(out_csv, centres, delimiter=",", header="x,y", comments="")
+    print(f"Saved {centres.shape[0]} circle centres to {out_csv}")
 
     # ───▶  DIAGNOSTIC POCKET ANALYSIS  ◀─────────────────────────────────────
     free     = poly.buffer(-R).buffer(0)            # safe interior strip
@@ -450,10 +691,6 @@ def main(json_file: str, out_csv="centres.csv"):
         pass
     # ─────────────────────────────────────────────────────────────────────────
 
-    # 5 ─ save + preview
-    np.savetxt(out_csv, centres, delimiter=",", header="x,y", comments="")
-    print(f"Saved {centres.shape[0]} circle centres to {out_csv}")
-    plot_layout(poly, centres, title="Optimised layout")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
