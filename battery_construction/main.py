@@ -177,7 +177,7 @@ def elabora_dati(input_file_path):
                 "diameter": cell_info["diameter"],
                 "height": cell_info["height"],
                 "voltage": cell_info["voltage"],
-                "capacity": cell_info["capacity"]
+                "capacity": cell_info["capacity"] * 1000
             },
             "data_output": data_output,
             "layout_data": layout_data
