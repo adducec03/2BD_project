@@ -36,7 +36,7 @@ from matplotlib.patches import Polygon as MplPolygon
 from time import perf_counter
 
 
-R = 15.0  # mm, radius of an 18650 seen from the top
+R = 9.0  # mm, radius of an 18650 seen from the top
 
 
 ##############################################################################
