@@ -57,16 +57,7 @@ def load_boundary(json_path: Path):
 # ------------- 1. Geometry helpers & feasibility checks --------------------
 ##############################################################################
 
-def residual_free_space(poly, centres, R=9.0, res=64):
-    """
-    Physical free space inside the polygon once the R-disks are carved out:
-        ℛ = poly \ ∪ B(ci, R)
-    """
-    if len(centres) == 0:
-        return poly
-    discs = [Point(x, y).buffer(R, resolution=res) for x, y in centres]
-    hull  = unary_union(discs)
-    return poly.difference(hull)
+
 
 
 def feasible_centre_region(poly: Polygon, centres: np.ndarray, R: float):
@@ -166,47 +157,10 @@ def largest_clearance_circle(poly: Polygon, centres: np.ndarray, R: float,
 
     return best_r, best_p
 
-def circle_fits(prep_poly, poly, x, y, r=R) -> bool:
-    """True if the closed disk radius r centred at (x,y) is wholly inside."""
-    pt = Point(x, y)
-    return prep_poly.contains(pt) and poly.exterior.distance(pt) >= r
-
-def plot_layout(poly, centres, r=R, title="Layout"):
-    fig, ax = plt.subplots(figsize=(6,6))
-    # boundary
-    ax.plot(*poly.exterior.xy, lw=2)
-    # circles
-    for x, y in centres:
-        ax.add_patch(plt.Circle((x, y), r, fill=False))
-    ax.set_aspect('equal')
-    ax.set_title(f"{title} ({len(centres)} cells)")
-    plt.show()
 
 
-def largest_empty_circle_on_region(region):
-    """Return (radius_mm, centre_point) for LEC inside 'region'."""
-    if region.is_empty:
-        return 0.0, None
-    circ = maximum_inscribed_circle(region)
-    if circ.geom_type == "Polygon":
-        r = math.sqrt(circ.area / math.pi)
-        c = circ.centroid
-    elif circ.geom_type == "Point":
-        r, c = 0.0, circ
-    else:  # LineString (slit): radius = half width
-        r, c = circ.length / 2.0, circ.interpolate(0.5, normalized=True)
-    return r, c
 
 
-def _draw_polygon(ax, geom, **kw):
-    """Draw Polygon or MultiPolygon boundary to the axes."""
-    if isinstance(geom, (Polygon)):
-        x, y = geom.exterior.xy
-        ax.plot(x, y, **kw)
-    elif isinstance(geom, (MultiPolygon,)):
-        for g in geom.geoms:
-            x, y = g.exterior.xy
-            ax.plot(x, y, **kw)
 
 def add_shapely_patch(ax, geom, facecolor=(0,1,0,0.7), edgecolor="#00000087",
                       zorder=0):
@@ -355,20 +309,7 @@ def oriented_hex_seed(poly: Polygon, r=R, n_phase=8):
     return centres_orig
 
 
-def hex_seed(poly, prep_poly, r=R):
-    minx, miny, maxx, maxy = poly.bounds
-    dx, dy = 2*r, np.sqrt(3)*r
-    centres = []
-    row, y = 0, miny
-    while y <= maxy:
-        x = minx + (row % 2) * r
-        while x <= maxx:
-            if circle_fits(prep_poly, poly, x, y, r):
-                centres.append([x, y])
-            x += dx
-        y += dy
-        row += 1
-    return np.asarray(centres, float)
+
 
 def best_hex_seed_two_angles(poly, n_phase=16):
     """Try the default orientation and a +30° rotated one, keep denser."""
@@ -390,81 +331,6 @@ def best_hex_seed_two_angles(poly, n_phase=16):
 
     return base if len(base) >= len(alt) else alt
 
-
-##############################################################################
-# ------------- 3. Fitness function for PSO ---------------------------------
-##############################################################################
-
-def pairwise_sq_dists(mat):
-    """Squared Euclidean distances for all unordered pairs (vectorised)."""
-    diff = mat[:, None, :] - mat[None, :, :]
-    # upper triangular (k>i) mask avoids double-count
-    iu = np.triu_indices(mat.shape[0], k=1)
-    return np.square(diff[iu]).sum(axis=1)
-
-def fitness_single(x_flat, poly,
-                   seed_flat=None,        # ← default = None
-                   λ_overlap=1.0, λ_outside=1.0, λ_move=0.5):
-    """
-    x_flat : 1-D view [x1,y1,x2,y2,…]
-    seed_flat : the original hex-grid positions (same length) or None
-    """
-    pts = x_flat.reshape(-1, 2)
-
-    # ---------- overlap penalty ------------------------------------------
-    d2 = pairwise_sq_dists(pts)
-    P_overlap = np.clip((2*R)**2 - d2, 0, None).sum()
-
-    # ---------- outside-polygon penalty ----------------------------------
-    P_out = sum((max(0.0, R-poly.exterior.distance(Point(x,y)))**2)
-                for x, y in pts)
-
-    # ---------- don’t-move penalty ---------------------------------------
-    if seed_flat is not None and λ_move > 0:
-        P_move = λ_move * np.square(x_flat - seed_flat).sum()
-    else:
-        P_move = 0.0
-
-    return λ_overlap*P_overlap + λ_outside*P_out + P_move
-
-
-def make_pso_f(poly, seed_flat=None):
-    """Return a PySwarms-compatible objective."""
-    def f(X):
-        return np.array([fitness_single(x, poly, seed_flat) for x in X])
-    return f
-
-
-##############################################################################
-# ------------- 4. Simple PSO global pass -----------------------------------
-##############################################################################
-
-def pso_refine(init_centres, poly, iters=800, particles=50):
-    n = init_centres.shape[0]
-    dim = 2*n
-
-    seed_flat = init_centres.flatten()
-
-    minx, miny, maxx, maxy = map(float, poly.bounds)
-    lb_pair = np.array([minx, miny])
-    ub_pair = np.array([maxx, maxy])
-    lb = np.tile(lb_pair, n)          # shape (dim,) float64
-    ub = np.tile(ub_pair, n)
-
-    # make absolutely sure every seed coord is inside [lb, ub]
-    init = init_centres.copy()
-    init[:, 0] = np.clip(init[:, 0], minx, maxx)
-    init[:, 1] = np.clip(init[:, 1], miny, maxy)
-
-    swarm = ps.single.GlobalBestPSO(
-        n_particles = particles,
-        dimensions  = dim,
-        options     = dict(c1=1.5, c2=2.0, w=0.9),
-        bounds      = (lb, ub),
-        init_pos    = np.tile(init.flatten(), (particles, 1)),
-    )
-    cost, pos = swarm.optimize(make_pso_f(poly, seed_flat), iters=iters, n_processes=None)
-    return pos.reshape(-1, 2)
 
 
 ##############################################################################
