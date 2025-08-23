@@ -182,6 +182,89 @@ def calc_parameters(y: int) -> Tuple[bool, Optional[int], Optional[int], Optiona
     _, b, a, c = best
     return (a, b, c)
 
+def verify_rls(r: int, l: int, s: int) -> Tuple[bool, Optional[int], Optional[int]]:
+    """
+    Verifica se esistono interi n,m tali che:
+        r = n*l + m*s
+    con vincoli:
+        - m pari
+        - n = m + 1 (quindi n dispari)
+
+    Restituisce:
+        (True, n, m) se esiste
+        (False, None, None) altrimenti
+    """
+    if not all(isinstance(x, int) for x in (r, l, s)):
+        raise TypeError("r, l, s devono essere interi")
+
+    if l + s == 0:
+        # Caso speciale: se l+s=0 ⇒ r deve essere = l
+        if r == l:
+            return (False, None, None)  # indeterminato, m qualsiasi (parità non gestita)
+        else:
+            return (False, None, None)
+
+    num = r - l
+    den = l + s
+    if num % den != 0:
+        return (False, None, None)
+
+    m = num // den
+    if m % 2 == 0:  # m pari
+        n = m + 1  # automaticamente dispari
+        return (True, n, m)
+
+    return (False, None, None)
+
+def verify_full_first_long_row(r: int, l: int, s: int) -> Tuple[bool, Optional[int], Optional[int]]:
+    """
+    Verifica se esistono interi m,n tali che:
+        r = m*l + n*s
+        |m - n| <= 1
+    Restituisce (True, m, n) se esiste, altrimenti (False, None, None).
+    Preferisce la soluzione con |m-n|=0, poi quelle con |m-n|=1.
+    """
+    if not all(isinstance(x, int) for x in (r, l, s)):
+        raise TypeError("r, l, s devono essere interi")
+
+    denom = l + s
+
+    if denom != 0:
+        # Caso |m-n|=0: m = n = k
+        num0 = r
+        if num0 % denom == 0:
+            k = num0 // denom
+            return True, k, k
+
+        # Caso m = n+1: m = k+1, n = k
+        num1 = r - l
+        if num1 % denom == 0:
+            k = num1 // denom
+            return True, k + 1, k
+
+        # Caso n = m+1: m = k, n = k+1
+        num2 = r - s
+        if num2 % denom == 0:
+            k = num2 // denom
+            return True, k, k + 1
+
+        return False, None, None
+
+    else:
+        # denom = 0  => s = -l
+        # r = m*l + n*(-l) = (m-n) * l
+        # Possibilità:
+        # - m=n  => r=0
+        # - m=n+1 => r=l
+        # - n=m+1 => r=s (= -l)
+        if r == 0:
+            return True, 0, 0  # m=n (|m-n|=0)
+        if r == l:
+            return True, 1, 0  # |m-n|=1
+        if r == s:
+            return True, 0, 1  # |m-n|=1
+        return False, None, None
+
 # ------------------------------------------------------------
 # main grouping routine
 # ------------------------------------------------------------
@@ -230,6 +313,25 @@ def group_xSyP_strict_reading(
     a=long
     b=short
 
+    start_from_short=False
+    make_al_rows_equal_size=False
+
+    minimum_row_size = row_len(0)
+    
+
+    if (row_len(0)!=row_len(1)):
+
+        if (row_len(0)<row_len(1) and verify_rls(row_len(0),long,short)[0] and long!=short):
+            print("start_from_short")
+            start_from_short=True
+        else:
+            if(verify_full_first_long_row(row_len(0),long,short)[0]):
+                    print("make_al_rows_equal_size")
+                    make_al_rows_equal_size=True
+                    minimum_row_size=min(row_len(0),row_len(1))
+                    rem=minimum_row_size
+
+
     while cid<(x*y)-1:
         c=rpg
         n = 0
@@ -239,6 +341,10 @@ def group_xSyP_strict_reading(
             # set the pattern for *this* row
             a = long if (r % 2 == 0) else short
             b = short if (r % 2 == 0) else long
+            if(start_from_short):
+                temp=a
+                a=b
+                b=temp
 
             # 1) try to place 'a' cells in this row
             if rem >= a and gid+n<x:
@@ -258,9 +364,21 @@ def group_xSyP_strict_reading(
                 elif(gid+n<x):
                     print (f"reached the groups limit current group:{gid+n}")
                 # not enough space → move to next row, same group
-                cid+=rem
-                r += 1
-                rem = row_len(r)
+                if (make_al_rows_equal_size):
+                    if (row_len(r)>minimum_row_size):
+                        cid+=rem+1
+                        r+=1
+                        rem=row_len(r)
+                    else:
+                        cid+=rem
+                        r+=1
+                        rem=minimum_row_size
+                else:
+                    cid+=rem
+                    r+=1
+                    rem=row_len(r)
+                #r += 1
+                #rem = row_len(r) if (make_al_rows_equal_size) else minimum_row_size
                 c-=1
                 t+=n
                 n=0
@@ -287,9 +405,23 @@ def group_xSyP_strict_reading(
                     print(f"not enough space, change row")
                 elif(gid+n>=x):
                     print (f"reached the groups limit current group:{gid+n}")
-                cid+=rem
-                r += 1
-                rem = row_len(r)
+                if (make_al_rows_equal_size):
+                    if (row_len(r)>minimum_row_size):
+                        cid+=rem+1
+                        r+=1
+                        rem=row_len(r)
+                    else:
+                        cid+=rem
+                        r+=1
+                        rem=minimum_row_size
+                else:
+                    cid+=rem
+                    r+=1
+                    rem=row_len(r)
+
+                #cid+=rem if (not make_al_rows_equal_size) else cid+rem+a
+                #r += 1
+                #rem = row_len(r) if (make_al_rows_equal_size) else minimum_row_size
                 c-=1
                 t+=n
                 n=0

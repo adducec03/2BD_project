@@ -1,5 +1,5 @@
 # Ignora file con estensioni specifiche
-*.json
+#*.json
 *.glb
 *.zip
 
