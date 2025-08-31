@@ -52,7 +52,7 @@ def elabora_dati(input_file_path):
     configurazioni_totali = []
 
     # 1. Prova con i parametri originali
-    configurazioni = fc.calcola_configurazioni_migliori(
+    _, configurazioni = fc.calcola_configurazioni_migliori(
         cell_voltage, cell_current, total_voltage, total_current,
         celle_max=max_cells, top_k=5
     )
@@ -73,10 +73,11 @@ def elabora_dati(input_file_path):
     # 2. Prova con riduzione capacità (cella attuale) e altre. celle
     if not configurazioni:
         print("🔄 Provo riduzione capacità con cella originale...")
-        config_ridotta, nuova_capacita = fc.trova_configurazione_con_capacita_ridotta(
+        config_ridotta_tuple, nuova_capacita = fc.trova_configurazione_con_capacita_ridotta(
             cell_voltage, cell_current, total_voltage, total_current, max_cells
         )
-        if config_ridotta:
+        if config_ridotta_tuple:
+            _, config_ridotta = config_ridotta_tuple
             print(f"⚠️ Trovata configurazione con capacità ridotta a {nuova_capacita} Ah")
             configurazioni_totali.extend([
                 (cfg, battery_diameter, battery_height, best_centers, default_cell)
@@ -96,22 +97,25 @@ def elabora_dati(input_file_path):
             celle_disponibili = len(centers_alt)
 
             # A. Con capacità originale
-            config_alt = fc.calcola_configurazioni_migliori(
+            config_alt_tuple = fc.calcola_configurazioni_migliori(
                 cell["voltage"], cell["capacity"], total_voltage, total_current,
                 celle_max=celle_disponibili, top_k=1        #seleziona una sola proposta per cella diversa
             )
-            if config_alt:
-                configurazioni_totali.extend([
-                    (cfg, diam, h, centers_alt, cell)
-                    for cfg in config_alt
-                ])
-                continue  # salta capacità ridotta se già va bene
+            if config_alt_tuple:
+                _, config_alt = config_alt_tuple
+                if config_alt:
+                    configurazioni_totali.extend([
+                        (cfg, diam, h, centers_alt, cell)
+                        for cfg in config_alt
+                    ])
+                    continue  # salta capacità ridotta se già va bene
 
             # B. Con capacità ridotta
-            config_ridotta, nuova_cap = fc.trova_configurazione_con_capacita_ridotta(
+            config_ridotta_tuple, nuova_cap = fc.trova_configurazione_con_capacita_ridotta(
                 cell["voltage"], cell["capacity"], total_voltage, total_current, celle_disponibili
             )
-            if config_ridotta:
+            if config_ridotta_tuple:
+                _, config_ridotta = config_ridotta_tuple
                 configurazioni_totali.extend([
                     (cfg, diam, h, centers_alt, cell)
                     for cfg in config_ridotta
@@ -173,7 +177,7 @@ def elabora_dati(input_file_path):
             "timestamp": timestamp,
             "battery_parameters": battery_data,
             "cell_used": {
-                "name": cell_info.get("type", "unknown"),
+                "name": cell_info.get("name") or cell_info.get("type") or "unknown",
                 "diameter": cell_info["diameter"],
                 "height": cell_info["height"],
                 "voltage": cell_info["voltage"],
