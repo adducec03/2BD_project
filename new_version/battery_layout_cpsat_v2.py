@@ -349,10 +349,9 @@ def build_graph(coords: np.ndarray, R: float, tol: float) -> Tuple[List[Tuple[in
 
 
 def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
-                 time_limit: int = 60, alpha: float = 0.1, seed: int = 0,
-                 degree_cap=4, Lmin=1,
-                 use_pair_snake: bool = True, start_corner: str = "TL",
-                 window_slack: int = 3):
+                 time_limit: int = 60, alpha: float = 0.1, seed: int = 0, Lmin=1,
+                 use_pair_snake: bool = True, degree_cap=4, start_corner: str = "TL",
+                 window_slack: int = 3, enforce_degree: bool = False):
     N = len(coords)
     if S * P > N:
         raise SystemExit(f"Celle richieste {S*P} > disponibili {N}")
@@ -440,12 +439,15 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
             )
 
     # link activation constraints and per-cell degree<=4
+    # link activation constraints (senza vincolo di grado per default)
     L = []
-    per_cell_degree = [model.NewIntVar(0, degree_cap, f"deg[{i}]") for i in range(N)]
-    deg_expr = [0 for _ in range(N)]
+
+    # solo se vuoi davvero limitare il grado, inizializza i contatori
+    if enforce_degree:
+        per_cell_degree = [model.NewIntVar(0, degree_cap, f"deg[{i}]") for i in range(N)]
+        deg_expr = [0 for _ in range(N)]
 
     for k in range(S-1):
-        # L_k
         Lk = model.NewIntVar(0, len(E), f"L[{k}]")
         link_terms = []
         for (i,j) in E:
@@ -454,18 +456,20 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
             model.Add(z2[(k,i,j)] <= x[(j,k)])
             model.Add(z2[(k,i,j)] <= x[(i,k+1)])
             link_terms += [z1[(k,i,j)], z2[(k,i,j)]]
-            # accumulate degree terms
-            deg_expr[i] = deg_expr[i] + z1[(k,i,j)] + z2[(k,i,j)]
-            deg_expr[j] = deg_expr[j] + z1[(k,i,j)] + z2[(k,i,j)]
+
+            if enforce_degree:
+                deg_expr[i] = deg_expr[i] + z1[(k,i,j)] + z2[(k,i,j)]
+                deg_expr[j] = deg_expr[j] + z1[(k,i,j)] + z2[(k,i,j)]
+
         model.Add(Lk == sum(link_terms))
         if Lmin > 0:
             model.Add(Lk >= Lmin)
         L.append(Lk)
 
-    # cap degree per cell
-    for i in range(N):
-        model.Add(per_cell_degree[i] == deg_expr[i])
-        model.Add(per_cell_degree[i] <= degree_cap)
+    if enforce_degree:
+        for i in range(N):
+            model.Add(per_cell_degree[i] == deg_expr[i])
+            model.Add(per_cell_degree[i] <= degree_cap)
 
     # objective: maximize links, keep them near target
     if len(L) > 0:
@@ -585,17 +589,18 @@ def plot_solution(coords, R, S, x, z1, z2, E, L, solver,
 def main():
 
     csv = "new_version/out.csv"
-    S=8
-    P=7
+    S=11
+    P=6
     radius=9.0
-    tol=1
+    tol=2
     time_limit=120
-    alpha=0.1
+    alpha=0.3
     degree_cap=6
-    Lmin=2
+    Lmin=1
     use_snake=False
     start_corner = "TL"
     window_slack=3
+    enforce_degree=False
 
     
 
@@ -611,7 +616,8 @@ def main():
     status, solver, x, r, L, z1, z2, E = solve_layout(
         coords, S, P, radius, tol,
         time_limit=time_limit, alpha=alpha, degree_cap=degree_cap, Lmin=Lmin,
-        use_pair_snake=use_snake, start_corner=start_corner, window_slack=window_slack
+        use_pair_snake=use_snake, start_corner=start_corner, window_slack=window_slack,
+        enforce_degree=enforce_degree
     )
 
     status_name = {cp_model.OPTIMAL:"OPTIMAL", cp_model.FEASIBLE:"FEASIBLE",
