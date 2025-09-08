@@ -18,6 +18,8 @@ import battery_layout_cpsat_v2 as bl
 from ortools.sat.python import cp_model
 from pack3d import build_glb_from_variant
 from build_battery_trimesh import convert_2d_to_3d
+from contact import attach_2d_contacts
+
 
 app = FastAPI()
 
@@ -505,6 +507,13 @@ def elabora_dati(input_file_path: str):
             }
         }
 
+        attach_2d_contacts(
+            variant["layout_data"],
+            parallel_degree=2,          # numero di vicini per cella
+            parallel_thresh_scale=1.20, # 1.1–1.3 va bene
+            edge_shrink_ratio=0.12      # accorcia leggermente verso il bordo
+        )
+
         variant_json = os.path.join(OUTPUT_DIR, f"fullOutput_{idx}.json")
         with open(variant_json, "w") as f:
             json.dump(variant, f, indent=2)
@@ -521,6 +530,7 @@ def elabora_dati(input_file_path: str):
             long_axis_on_model = "Y",         # cambia in "Z" se il tuo modello ha già l’asse lungo su Z
             colorize_groups = True
         )
+        
 
         output_varianti.append({"json": variant_json, "glb": variant_glb})
 
