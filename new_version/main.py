@@ -12,11 +12,12 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.responses import FileResponse
 
-# === NUOVI IMPORT ===
 import circle_packing as cp
 import findBestConfiguration as fc
 import battery_layout_cpsat_v2 as bl
 from ortools.sat.python import cp_model
+from pack3d import build_glb_from_variant
+from build_battery_trimesh import convert_2d_to_3d
 
 app = FastAPI()
 
@@ -318,6 +319,7 @@ def _estrai_gruppi_e_link(
 
 # ------------------------- pipeline principale -------------------------
 def elabora_dati(input_file_path: str):
+
     # 0) leggo l’intero JSON di input (outline + parametri batteria)
     with open(input_file_path, "r") as f:
         incoming = json.load(f)
@@ -437,7 +439,7 @@ def elabora_dati(input_file_path: str):
         # estraggo gruppi e link attivi
         groups, links = _estrai_gruppi_e_link(solver, x, z1, z2, E, S)
 
-                # --- costruisci i segmenti "serie_connections" come coppie di coordinate (from/to)
+        # --- costruisci i segmenti "serie_connections" come coppie di coordinate (from/to)
         serie_connections = _build_serie_connections(links, groups, centres, S)
 
         # --- normalizza tipi/scale come richiesto dal front-end
@@ -507,17 +509,33 @@ def elabora_dati(input_file_path: str):
         with open(variant_json, "w") as f:
             json.dump(variant, f, indent=2)
 
-        output_varianti.append({"json": variant_json})
+        variant_glb = os.path.join(OUTPUT_DIR, f"battery3D_{idx}.glb")
+        convert_2d_to_3d(
+            h_mm = 65.0,
+            input_json = variant_json,
+            output_glb = variant_glb,
+            model_glb = os.path.join(BASE_DIR, "model_battery.glb"),
+            xy_scale = 1.0,
+            flip_groups_odd = True,
+            drop_nodes_with = None,           # <-- NON filtrare "Text/Logo"
+            long_axis_on_model = "Y",         # cambia in "Z" se il tuo modello ha già l’asse lungo su Z
+            colorize_groups = True
+        )
+
+        output_varianti.append({"json": variant_json, "glb": variant_glb})
 
     if not output_varianti:
         raise HTTPException(status_code=400, detail="❌ Nessuna variante valida generata (CP-SAT fallito).")
+    
+
 
     # ZIP finale
     zip_name = os.path.join(OUTPUT_DIR, "output_varianti.zip")
     with zipfile.ZipFile(zip_name, "w") as zipf:
         for v in output_varianti:
             zipf.write(v["json"], arcname=os.path.basename(v["json"]))
-
+            if "glb" in v and os.path.isfile(v["glb"]):
+                zipf.write(v["glb"], arcname=os.path.basename(v["glb"]))
 
 # ------------------------- endpoint FastAPI -------------------------
 # uvicorn main:app --host 0.0.0.0 --port 5050
