@@ -54,6 +54,73 @@ import numpy.linalg as npl
 
 
 import numpy.linalg as npl
+from ortools.sat.python import cp_model
+
+
+
+
+def make_profile(profile_name: str, time_s: float, seed: int, workers: int):
+    p = dict(
+        max_time_in_seconds=float(time_s),
+        num_search_workers=int(workers),
+        random_seed=int(seed),
+        randomize_search=True,
+        search_branching=cp_model.PORTFOLIO_SEARCH,
+        log_search_progress=True,
+    )
+    if profile_name == "fast":
+        p.update(dict(cp_model_presolve=True, cp_model_probing_level=0, linearization_level=0))
+    elif profile_name == "quality":
+        p.update(dict(cp_model_presolve=True, cp_model_probing_level=1, linearization_level=1))
+    elif profile_name == "aggressive":
+        p.update(dict(cp_model_presolve=True, cp_model_probing_level=2, linearization_level=2))
+    return p
+
+def auto_tune_and_solve(coords, S, P, R, tol,
+                        time_budget=60,
+                        target_T=None,     # metti <= 2*P, altrimenti None
+                        degree_cap=6,
+                        enforce_degree=False,
+                        profiles=("fast","fast","quality"),
+                        seeds=(0,1,2,3),
+                        workers=6):
+    combos = []
+    for t in range(max(len(profiles), len(seeds))):
+        combos.append( (profiles[t % len(profiles)], seeds[t % len(seeds)]) )
+
+    per_run = max(5, time_budget // max(1, len(combos)))
+    best_pack, best_T, best_sumL = None, -1, -1
+
+    # cap target_T a 2*P (limite realistico)
+    if target_T is not None:
+        target_T = min(target_T, 2*P)
+
+    for (prof, seed) in combos:
+        cp_params = make_profile(prof, per_run, seed, workers)
+
+        status, solver, x, r, L, z1, z2, E, T = solve_layout(
+            coords, S, P, R, tol,
+            time_limit=per_run, alpha=0.0, Lmin=1,
+            degree_cap=degree_cap, enforce_degree=enforce_degree,
+            cp_params=cp_params
+        )
+
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            tval = solver.Value(T) if T is not None else 0
+            sumL = sum(int(solver.Value(Lk)) for Lk in L)
+            if (tval > best_T) or (tval == best_T and sumL > best_sumL):
+                best_pack = (status, solver, x, r, L, z1, z2, E, T)
+                best_T, best_sumL = tval, sumL
+            if target_T is not None and tval >= target_T:
+                break
+
+    # se nessuna run è FEASIBLE/OPTIMAL, ritorna l’ultima (best_pack resta None)
+    if best_pack is not None:
+        return best_pack
+    else:
+        return status, solver, x, r, L, z1, z2, E, T
+    
+
 
 def preview_pair_snake(coords, E, P, start_corner="TL", title=None):
     import matplotlib.pyplot as plt
@@ -348,158 +415,202 @@ def build_graph(coords: np.ndarray, R: float, tol: float) -> Tuple[List[Tuple[in
     return E, A
 
 
+def build_acyclic_arcs(coords: np.ndarray, E: List[Tuple[int,int]]):
+    """
+    Orienta gli archi non direzionali E in modo aciclico
+    usando la proiezione lungo l’asse di massima varianza (e1).
+    Restituisce:
+      - A_dir: lista di archi diretti (u, v) con 'ordine' non decrescente lungo (s, id)
+      - incoming: dizionario i -> lista di archi (u, i) entranti
+    """
+    e1, _ = pca_axes(coords)
+    s = coords @ e1  # proiezione
+    def orient(i, j):
+        if s[i] < s[j]:
+            return (i, j)
+        if s[i] > s[j]:
+            return (j, i)
+        # tie-break stabile per evitare piccoli cicli su s uguali
+        return (i, j) if i < j else (j, i)
+
+    A_dir = [orient(i, j) for (i, j) in E]
+    incoming = {i: [] for i in range(len(coords))}
+    for (u, v) in A_dir:
+        incoming[v].append((u, v))
+    return A_dir, incoming
+
+
 def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
-                 time_limit: int = 60, alpha: float = 0.1, seed: int = 0, Lmin=1,
-                 use_pair_snake: bool = True, degree_cap=4, start_corner: str = "TL",
-                 window_slack: int = 3, enforce_degree: bool = False):
+                 time_limit: int = 60, alpha: float = 0.1, seed: int = 0, Lmin=0,
+                 degree_cap=4, enforce_degree: bool = False,
+                 cp_params: dict | None = None):
     N = len(coords)
     if S * P > N:
         raise SystemExit(f"Celle richieste {S*P} > disponibili {N}")
 
+    # --- Grafo: archi non diretti E e diretti A (bidirezionali) ---
     E, A = build_graph(coords, R, tol)
 
-
-    # ---------- pair-snake ----------
-    if use_pair_snake:
-        allowed_sets, snake_order, row_idx = pair_snake_allowed_sets(
-            coords, E, S, P, start_corner=start_corner, window_slack=window_slack
-        )
-    else:
-        allowed_sets = [set(range(len(coords))) for _ in range(S)]
-
-
+    # --- adiacenze per cella e celle "interne" (grado 6) ---
+    neighbors = {i: [] for i in range(N)}
+    for (i, j) in E:
+        neighbors[i].append(j)
+        neighbors[j].append(i)
+    interior_idx = [i for i in range(N) if len(neighbors[i]) == 6]  # solo celle al centro
 
     model = cp_model.CpModel()
     rng = np.random.default_rng(seed)
 
-   
-
-    # decision vars + blocco fuori finestra
+    # --- Variabili x/r ---
     x, r = {}, {}
     for i in range(N):
         for k in range(S):
-            xi = model.NewBoolVar(f"x[{i},{k}]")
-            x[(i,k)] = xi
-            if use_pair_snake and i not in allowed_sets[k]:
-                model.Add(xi == 0)
+            x[(i,k)] = model.NewBoolVar(f"x[{i},{k}]")
             r[(i,k)] = model.NewBoolVar(f"r[{i},{k}]")
 
+    # --- use[i] : 1 se la cella i è assegnata a qualche gruppo ---
+    use = {}
+    for i in range(N):
+        use[i] = model.NewIntVar(0, 1, f"use[{i}]")
+        model.Add(use[i] == sum(x[(i,k)] for k in range(S)))  # somma di boolean → 0/1
 
-
-                    
-    # flows
-    f = {}      # f[i,j,k] integer 0..P-1
-    cap = P - 1
-    for (i,j) in A:
-        for k in range(S):
-            f[(i,j,k)] = model.NewIntVar(0, cap, f"f[{i}->{j},{k}]")
-
-    # link vars between consecutive groups
-    z1 = {}     # group k uses i, group k+1 uses j
-    z2 = {}     # group k uses j, group k+1 uses i
-    for k in range(S-1):
-        for (i,j) in E:
-            z1[(k,i,j)] = model.NewBoolVar(f"z1[{k},{i}-{j}]")
-            z2[(k,i,j)] = model.NewBoolVar(f"z2[{k},{i}-{j}]")
-
-    # group sizes
+    # (1) esattamente P celle per gruppo
     for k in range(S):
         model.Add(sum(x[(i,k)] for i in range(N)) == P)
 
-    # each cell at most one group
+    # (2) ogni cella al più in un gruppo
     for i in range(N):
         model.Add(sum(x[(i,k)] for k in range(S)) <= 1)
 
-    # roots
+    # (3) 1 root per gruppo, root ≤ x
     for k in range(S):
         model.Add(sum(r[(i,k)] for i in range(N)) == 1)
         for i in range(N):
             model.Add(r[(i,k)] <= x[(i,k)])
 
-    # flow capacity (only along selected nodes)
-    for (i,j) in A:
+    # --- (4) Connettività via parent-edge su A + MTZ (niente flussi) ---
+    # y[i->j,k] = 1 se j ha genitore i nel gruppo k
+    y = {}
+    for (i, j) in A:
         for k in range(S):
-            model.Add(f[(i,j,k)] <= cap * x[(i,k)])
-            model.Add(f[(i,j,k)] <= cap * x[(j,k)])
+            y[(i, j, k)] = model.NewBoolVar(f"y[{i}->{j},{k}]")
+            model.Add(y[(i, j, k)] <= x[(i, k)])
+            model.Add(y[(i, j, k)] <= x[(j, k)])
 
-    # flow conservation (connectivity)
-    # Σ_in - Σ_out = x - P*r
-    out_arcs = defaultdict(list)
-    in_arcs = defaultdict(list)
-    for (i,j) in A:
-        out_arcs[(i)].append((i,j))
-        in_arcs[(j)].append((i,j))
+    # incoming[j] = archi entranti (i->j)
+    incoming = {j: [] for j in range(N)}
+    for (i, j) in A:
+        incoming[j].append((i, j))
 
+    # per ogni nodo selezionato: o è root, o ha esattamente 1 genitore
     for k in range(S):
         for i in range(N):
-            model.Add(
-                sum(f[(u,v,k)] for (u,v) in in_arcs[i])
-                - sum(f[(u,v,k)] for (u,v) in out_arcs[i])
-                == x[(i,k)] - P * r[(i,k)]
-            )
+            model.Add(sum(y[(u, i, k)] for (u, _v) in incoming[i]) + r[(i, k)] == x[(i, k)])
 
-    # link activation constraints and per-cell degree<=4
-    # link activation constraints (senza vincolo di grado per default)
+    # Potenziali MTZ per evitare cicli e “radiare” dall root: u in [0..P-1]
+    u = {}
+    for i in range(N):
+        for k in range(S):
+            u[(i,k)] = model.NewIntVar(0, P-1, f"u[{i},{k}]")
+            # non selezionato -> u=0 ; selezionato non-root -> u>=1 ; root -> u=0
+            model.Add(u[(i,k)] <= (P-1) * x[(i,k)])
+            model.Add(u[(i,k)] >= x[(i,k)] - r[(i,k)])
+            model.Add(u[(i,k)] == 0).OnlyEnforceIf(r[(i,k)])
+
+    # --- Rilevazione "buco": cella non assegnata con TUTTI i vicini assegnati ---
+    holes = []   # lista di h[i] da penalizzare
+    for i in interior_idx:
+        # g[i] = AND_{j in N(i)} use[j]
+        gi = model.NewBoolVar(f"allN_used[{i}]")
+        # g <= use[j] per tutti i vicini
+        for j in neighbors[i]:
+            model.Add(gi <= use[j])
+        # g >= sum(use[j]) - (m-1), con m = grado(i)
+        m = len(neighbors[i])  # qui m=6
+        model.Add(gi >= sum(use[j] for j in neighbors[i]) - (m - 1))
+
+        # h[i] = (1 - use[i]) AND gi
+        hi = model.NewBoolVar(f"hole[{i}]")
+        model.Add(hi <= 1 - use[i])
+        model.Add(hi <= gi)
+        # h >= gi + (1 - use[i]) - 1  →  h >= gi - use[i]
+        model.Add(hi >= gi - use[i])
+        holes.append(hi)
+
+    M = P  # big-M minimal
+    for (i, j) in A:
+        for k in range(S):
+            model.Add(u[(j,k)] >= u[(i,k)] + 1 - M * (1 - y[(i, j, k)]))
+
+    # --- (5) Link tra gruppi consecutivi (z1/z2) su TUTTI gli archi E ---
     L = []
-
-    # solo se vuoi davvero limitare il grado, inizializza i contatori
-    if enforce_degree:
-        per_cell_degree = [model.NewIntVar(0, degree_cap, f"deg[{i}]") for i in range(N)]
-        deg_expr = [0 for _ in range(N)]
-
+    z1, z2 = {}, {}
     for k in range(S-1):
-        Lk = model.NewIntVar(0, len(E), f"L[{k}]")
+        Lk = model.NewIntVar(0, max(1, 2*len(E)), f"L[{k}]")
         link_terms = []
-        for (i,j) in E:
+        for (i, j) in E:
+            z1[(k,i,j)] = model.NewBoolVar(f"z1[{k},{i}-{j}]")  # i in k, j in k+1
+            z2[(k,i,j)] = model.NewBoolVar(f"z2[{k},{i}-{j}]")  # j in k, i in k+1
             model.Add(z1[(k,i,j)] <= x[(i,k)])
             model.Add(z1[(k,i,j)] <= x[(j,k+1)])
             model.Add(z2[(k,i,j)] <= x[(j,k)])
             model.Add(z2[(k,i,j)] <= x[(i,k+1)])
             link_terms += [z1[(k,i,j)], z2[(k,i,j)]]
-
-            if enforce_degree:
-                deg_expr[i] = deg_expr[i] + z1[(k,i,j)] + z2[(k,i,j)]
-                deg_expr[j] = deg_expr[j] + z1[(k,i,j)] + z2[(k,i,j)]
-
-        model.Add(Lk == sum(link_terms))
+        model.Add(Lk == sum(link_terms)) if link_terms else model.Add(Lk == 0)
         if Lmin > 0:
             model.Add(Lk >= Lmin)
         L.append(Lk)
 
+    # (OPZ) limite di grado – off per default
     if enforce_degree:
+        per_cell_degree = [model.NewIntVar(0, degree_cap, f"deg[{i}]") for i in range(N)]
+        deg_expr = [0 for _ in range(N)]
+        for k in range(S-1):
+            for (i, j) in E:
+                deg_expr[i] = deg_expr[i] + z1[(k,i,j)] + z2[(k,i,j)]
+                deg_expr[j] = deg_expr[j] + z1[(k,i,j)] + z2[(k,i,j)]
         for i in range(N):
             model.Add(per_cell_degree[i] == deg_expr[i])
             model.Add(per_cell_degree[i] <= degree_cap)
 
-    # objective: maximize links, keep them near target
-    if len(L) > 0:
-        target = min(2*P, max(0, int(np.mean([len(E)//S for _ in range(S)]))))
-        # absolute deviation vars
-        devs = []
+   # --- Obiettivo: copertura, minimo T, somma contatti, penalità buchi ---
+    T = None
+    if L:
+        b = []
         for k, Lk in enumerate(L):
-            over = model.NewIntVar(0, 2*P, f"over[{k}]")
-            under = model.NewIntVar(0, 2*P, f"under[{k}]")
-            model.Add(Lk - target <= over)
-            model.Add(target - Lk <= under)
-            dev = model.NewIntVar(0, 2*P, f"dev[{k}]")
-            model.Add(dev == over + under)
-            devs.append(dev)
-        # Scalar objective
-        # maximize sum(L) - alpha * sum(dev)
-        # CP-SAT maximizes; scale to integers
-        ALPHA = int(alpha * 100)
-        model.Maximize( 100 * sum(L) - ALPHA * sum(devs) )
+            bk = model.NewBoolVar(f"connected[{k}]")
+            model.Add(Lk >= bk)
+            b.append(bk)
+
+        T = model.NewIntVar(0, 2*P, "T_min_links")
+        for Lk in L:
+            model.Add(T <= Lk)
+
+        wCover, wT, wSum = 10_000, 1_000, 100
+        wHole = 300   # <<< peso penalità buchi (puoi tararlo)
+        if holes:
+            model.Maximize(wCover * sum(b) + wT * T + wSum * sum(L) - wHole * sum(holes))
+        else:
+            model.Maximize(wCover * sum(b) + wT * T + wSum * sum(L))
     else:
         model.Maximize(0)
 
-    # solve
+    # --- Solver settings + override (auto-tuning) ---
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit)
-    solver.parameters.num_search_workers = 8
+    solver.parameters.num_search_workers = 6
+    solver.parameters.cp_model_probing_level = 0
+    solver.parameters.linearization_level = 0
+    solver.parameters.search_branching = cp_model.PORTFOLIO_SEARCH
+    solver.parameters.random_seed = int(seed)
     solver.parameters.log_search_progress = True
+    if cp_params:
+        for k, v in cp_params.items():
+            setattr(solver.parameters, k, v)
 
     status = solver.Solve(model)
-    return status, solver, x, r, L, z1, z2, E
+    return status, solver, x, r, L, z1, z2, E, T
+
 
 
 def plot_solution(coords, R, S, x, z1, z2, E, L, solver,
@@ -587,54 +698,48 @@ def plot_solution(coords, R, S, x, z1, z2, E, L, solver,
 
 
 def main():
-
     csv = "new_version/out.csv"
-    S=11
-    P=6
-    radius=9.0
-    tol=2
-    time_limit=120
-    alpha=0.3
-    degree_cap=6
-    Lmin=1
-    use_snake=False
-    start_corner = "TL"
-    window_slack=3
-    enforce_degree=False
-
-    
+    S = 20
+    P = 5
+    radius = 9.0
+    tol = 2
+    time_budget = 500
+    degree_cap = 6
+    enforce_degree = False
+    target_T=2*P
 
     df = pd.read_csv(csv)
     coords = df[['x','y']].to_numpy()
 
-    E, A = build_graph(coords, radius, tol)
-
-    # Anteprima serpentina (prima di lanciare il solver)
-    #preview_pair_snake(coords, E, P, start_corner="TL")
-    
-
-    status, solver, x, r, L, z1, z2, E = solve_layout(
+    # tuning senza snake
+    pack = auto_tune_and_solve(
         coords, S, P, radius, tol,
-        time_limit=time_limit, alpha=alpha, degree_cap=degree_cap, Lmin=Lmin,
-        use_pair_snake=use_snake, start_corner=start_corner, window_slack=window_slack,
-        enforce_degree=enforce_degree
+        time_budget=time_budget,
+        target_T=target_T,             
+        degree_cap=degree_cap,
+        enforce_degree=enforce_degree,
+        profiles=("fast","fast","quality"),
+        seeds=(0,1,2,3),
+        workers=6
     )
 
+    status, solver, x, r, L, z1, z2, E, T = pack
     status_name = {cp_model.OPTIMAL:"OPTIMAL", cp_model.FEASIBLE:"FEASIBLE",
                    cp_model.INFEASIBLE:"INFEASIBLE", cp_model.MODEL_INVALID:"MODEL_INVALID",
                    cp_model.UNKNOWN:"UNKNOWN"}.get(status, str(status))
     print("Solver status:", status_name)
+
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        if L:
-            links=[int(solver.Value(v)) for v in L]
-            print("Links between successive groups:", links, "  avg:", sum(links)/len(links))
+        links = [int(solver.Value(v)) for v in L]
+        tval = solver.Value(T) if T is not None else None
+        print(f"min_k Lk = {tval}   sum(L) = {sum(links)}   per-k: {links}")
         plot_solution(
             coords, radius, S, x, z1, z2, E, L, solver,
             title=f"{S}S{P}P — CP-SAT ({status_name})",
             save=None, show_links=True, show_arrows=True
         )
     else:
-        print("Nessuna soluzione trovata con i vincoli dati nel tempo limite.")
+        print("Nessuna soluzione trovata entro il budget.")
 
 
 if __name__ == "__main__":
