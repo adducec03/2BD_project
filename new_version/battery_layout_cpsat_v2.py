@@ -83,7 +83,8 @@ def auto_tune_and_solve(coords, S, P, R, tol,
                         enforce_degree=False,
                         profiles=("fast","fast","quality"),
                         seeds=(0,1,2,3),
-                        workers=6):
+                        workers=6,
+                        use_hole_penality=False):
     combos = []
     for t in range(max(len(profiles), len(seeds))):
         combos.append( (profiles[t % len(profiles)], seeds[t % len(seeds)]) )
@@ -100,9 +101,9 @@ def auto_tune_and_solve(coords, S, P, R, tol,
 
         status, solver, x, r, L, z1, z2, E, T = solve_layout(
             coords, S, P, R, tol,
-            time_limit=per_run, alpha=0.0, Lmin=1,
+            time_limit=per_run, alpha=0.0, Lmin=0,
             degree_cap=degree_cap, enforce_degree=enforce_degree,
-            cp_params=cp_params
+            cp_params=cp_params, use_hole_penality=False
         )
 
         if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -441,15 +442,16 @@ def build_acyclic_arcs(coords: np.ndarray, E: List[Tuple[int,int]]):
 
 
 def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
-                 time_limit: int = 60, alpha: float = 0.1, seed: int = 0, Lmin=0,
+                 time_limit: int = 60, alpha: float = 0.1, seed: int = 0, Lmin=1,
                  degree_cap=4, enforce_degree: bool = False,
-                 cp_params: dict | None = None):
+                 cp_params: dict | None = None, use_hole_penality=False):
     N = len(coords)
     if S * P > N:
         raise SystemExit(f"Celle richieste {S*P} > disponibili {N}")
 
     # --- Grafo: archi non diretti E e diretti A (bidirezionali) ---
-    E, A = build_graph(coords, R, tol)
+    E, _ = build_graph(coords, R, tol)
+    A, incoming = build_acyclic_arcs(coords, E) 
 
     # --- adiacenze per cella e celle "interne" (grado 6) ---
     neighbors = {i: [] for i in range(N)}
@@ -507,40 +509,32 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
         for i in range(N):
             model.Add(sum(y[(u, i, k)] for (u, _v) in incoming[i]) + r[(i, k)] == x[(i, k)])
 
-    # Potenziali MTZ per evitare cicli e “radiare” dall root: u in [0..P-1]
-    u = {}
-    for i in range(N):
-        for k in range(S):
-            u[(i,k)] = model.NewIntVar(0, P-1, f"u[{i},{k}]")
-            # non selezionato -> u=0 ; selezionato non-root -> u>=1 ; root -> u=0
-            model.Add(u[(i,k)] <= (P-1) * x[(i,k)])
-            model.Add(u[(i,k)] >= x[(i,k)] - r[(i,k)])
-            model.Add(u[(i,k)] == 0).OnlyEnforceIf(r[(i,k)])
+
 
     # --- Rilevazione "buco": cella non assegnata con TUTTI i vicini assegnati ---
     holes = []   # lista di h[i] da penalizzare
-    for i in interior_idx:
-        # g[i] = AND_{j in N(i)} use[j]
-        gi = model.NewBoolVar(f"allN_used[{i}]")
-        # g <= use[j] per tutti i vicini
-        for j in neighbors[i]:
-            model.Add(gi <= use[j])
-        # g >= sum(use[j]) - (m-1), con m = grado(i)
-        m = len(neighbors[i])  # qui m=6
-        model.Add(gi >= sum(use[j] for j in neighbors[i]) - (m - 1))
+    if use_hole_penality:
+        for i in interior_idx:
+            # g[i] = AND_{j in N(i)} use[j]
+            gi = model.NewBoolVar(f"allN_used[{i}]")
+            # g <= use[j] per tutti i vicini
+            for j in neighbors[i]:
+                model.Add(gi <= use[j])
+            # g >= sum(use[j]) - (m-1), con m = grado(i)
+            m = len(neighbors[i])  # qui m=6
+            model.Add(gi >= sum(use[j] for j in neighbors[i]) - (m - 1))
 
-        # h[i] = (1 - use[i]) AND gi
-        hi = model.NewBoolVar(f"hole[{i}]")
-        model.Add(hi <= 1 - use[i])
-        model.Add(hi <= gi)
-        # h >= gi + (1 - use[i]) - 1  →  h >= gi - use[i]
-        model.Add(hi >= gi - use[i])
-        holes.append(hi)
+            # h[i] = (1 - use[i]) AND gi
+            hi = model.NewBoolVar(f"hole[{i}]")
+            model.Add(hi <= 1 - use[i])
+            model.Add(hi <= gi)
+            # h >= gi + (1 - use[i]) - 1  →  h >= gi - use[i]
+            model.Add(hi >= gi - use[i])
+            holes.append(hi)
 
-    M = P  # big-M minimal
-    for (i, j) in A:
-        for k in range(S):
-            model.Add(u[(j,k)] >= u[(i,k)] + 1 - M * (1 - y[(i, j, k)]))
+
+    for k in range(S):
+        model.Add(sum(y[(i, j, k)] for (i, j) in A) == sum(x[(i, k)] for i in range(N)) - 1)
 
     # --- (5) Link tra gruppi consecutivi (z1/z2) su TUTTI gli archi E ---
     L = []
@@ -598,11 +592,13 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
     # --- Solver settings + override (auto-tuning) ---
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit)
-    solver.parameters.num_search_workers = 6
-    solver.parameters.cp_model_probing_level = 0
-    solver.parameters.linearization_level = 0
+    solver.parameters.num_search_workers = -1       # usa tutti i core
+    solver.parameters.cp_model_presolve = True
+    solver.parameters.cp_model_probing_level = 2
+    solver.parameters.linearization_level = 2
     solver.parameters.search_branching = cp_model.PORTFOLIO_SEARCH
-    solver.parameters.random_seed = int(seed)
+    solver.parameters.symmetry_level = 2
+    solver.parameters.randomize_search = True
     solver.parameters.log_search_progress = True
     if cp_params:
         for k, v in cp_params.items():
@@ -699,14 +695,15 @@ def plot_solution(coords, R, S, x, z1, z2, E, L, solver,
 
 def main():
     csv = "new_version/out.csv"
-    S = 20
-    P = 5
+    S = 7
+    P = 8
     radius = 9.0
     tol = 2
-    time_budget = 500
+    time_budget = 60
     degree_cap = 6
     enforce_degree = False
     target_T=2*P
+    use_hole_penality=False
 
     df = pd.read_csv(csv)
     coords = df[['x','y']].to_numpy()
@@ -720,7 +717,8 @@ def main():
         enforce_degree=enforce_degree,
         profiles=("fast","fast","quality"),
         seeds=(0,1,2,3),
-        workers=6
+        workers=6,
+        use_hole_penality=use_hole_penality
     )
 
     status, solver, x, r, L, z1, z2, E, T = pack
