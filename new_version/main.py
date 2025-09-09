@@ -19,6 +19,8 @@ from ortools.sat.python import cp_model
 from pack3d import build_glb_from_variant
 from build_battery_trimesh import convert_2d_to_3d
 from contact import attach_2d_contacts
+from thermal import save_thermal_png
+from thermal_pybamm import save_thermal_png_for_variant
 
 
 app = FastAPI()
@@ -28,6 +30,9 @@ CELLE_DISPONIBILI_PATH = os.path.join(BASE_DIR, "celle_disponibili.json")
 
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+THERMAL_DIR = os.path.join(OUTPUT_DIR, "thermal")
+os.makedirs(THERMAL_DIR, exist_ok=True)
 
 
 # ------------------------- helper: lettura parametri batteria -------------------------
@@ -175,7 +180,8 @@ def _compute_centres_with_cp(json_file: str, R: float) -> List[Tuple[float, floa
     """
     Implementa esattamente la pipeline richiesta con circle_packing.
     """
-    poly, _ = cp.load_boundary(Path(json_file))
+    poly, _, meta = cp.load_boundary(Path(json_file), to_units="mm", require_scale=False)
+    print(f"[loader] units=mm, px->mm={meta['px_to_mm']:.5f}, scale_cm_per_px={meta['scale_cm_per_px']}")
 
     centres = cp.best_hex_seed_two_angles(poly, n_phase=16)
     print("hex grid :", len(centres))
@@ -402,7 +408,7 @@ def elabora_dati(input_file_path: str):
             continue
 
         # Parametri solver (tieni i tuoi default preferiti)
-        time_budget = 30
+        time_budget = 120
         tol = 2.0
         degree_cap = 6
         enforce_degree = False
@@ -517,6 +523,28 @@ def elabora_dati(input_file_path: str):
         variant_json = os.path.join(OUTPUT_DIR, f"fullOutput_{idx}.json")
         with open(variant_json, "w") as f:
             json.dump(variant, f, indent=2)
+
+        # salva PNG termica per questa variante
+        thermal_dir = os.path.join(OUTPUT_DIR, "thermal")
+        os.makedirs(thermal_dir, exist_ok=True)
+
+        # corrente di pacco (A) – nel tuo main la hai già come 'total_current'
+        pack_I_A = float(total_current)  # è già in A secondo il tuo parsing
+        # dimensioni cella in mm:
+        d_mm = int(round((cell_info.get("diameter") or battery_diameter)))
+        h_mm = float((cell_info.get("height") or battery_height) * 10.0)
+
+        png_out = os.path.join(thermal_dir, f"thermal_{idx}.png")
+        save_thermal_png_for_variant(
+            variant_json_path=variant_json,
+            out_png_path=png_out,
+            d_mm=d_mm,
+            h_mm=h_mm,
+            pack_current_A=pack_I_A,
+            ambient_C=25.0,
+            soc0=0.6,
+            duration_s=300.0
+        )
 
         variant_glb = os.path.join(OUTPUT_DIR, f"battery3D_{idx}.glb")
         convert_2d_to_3d(

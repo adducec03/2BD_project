@@ -43,14 +43,76 @@ R = 9.0  # mm, radius of an 18650 seen from the top
 # ------------- 0. Parse command-line & input JSON --------------------------
 ##############################################################################
 
-def load_boundary(json_path: Path):
-    data = json.loads(json_path.read_text())
+def _detect_scale_cm_per_px(disegno: dict):
+    """
+    Ritorna il fattore cm/px se presente o ricavabile, altrimenti None.
+    Priorità:
+      1) disegno["scale_cm_per_px"]
+      2) mediana di (misure_cm[i] / misure_px[i]) se entrambe presenti
+    """
+    s = disegno.get("scale_cm_per_px", None)
+    if isinstance(s, (int, float)) and s > 0:
+        return float(s)
+
+    cm = disegno.get("misure_cm")
+    px = disegno.get("misure_px")
+    if isinstance(cm, list) and isinstance(px, list) and len(cm) == len(px) and len(px) > 0:
+        pairs = [(float(c), float(p)) for c, p in zip(cm, px) if p and float(p) > 0]
+        if pairs:
+            ratios = [c/p for c, p in pairs]  # cm/px
+            return float(np.median(ratios))
+
+    # JSON vecchio → nessuna scala esplicita
+    return None
+
+def load_boundary(json_path, to_units="mm", require_scale=False):
+    """
+    Carica il poligono dal JSON e converte le coordinate da pixel alle unità desiderate.
+    - to_units: "mm" (default) | "cm" | "m"
+    - require_scale: se True e non c'è scala → solleva ValueError; se False → usa px come mm.
+
+    Ritorna: (poly_in_units, prepared_poly, meta_dict)
+      meta_dict contiene: {"px_to_mm":..., "px_to_cm":..., "scale_cm_per_px":...}
+    """
+    data = json.loads(open(json_path, "r").read())
     disegno = json.loads(data["disegnoJson"])["disegno"]
-    verts = [(v["x"], v["y"]) for v in disegno["vertici"]]
-    poly   = Polygon(verts).buffer(0)       # tidy self-intersections
-    if not poly.is_valid:                   # still crooked? abort early
+
+    verts_px = [(float(v["x"]), float(v["y"])) for v in disegno["vertici"]]
+    s_cm_per_px = _detect_scale_cm_per_px(disegno)
+
+    if s_cm_per_px is None:
+        if require_scale:
+            raise ValueError("Scala assente nel JSON (né scale_cm_per_px né misure_cm/misure_px).")
+        # fallback retro-compatibile: considera 1 px ≈ 1 mm
+        px_to_mm = 1.0
+        px_to_cm = 0.1
+    else:
+        px_to_cm = s_cm_per_px
+        px_to_mm = s_cm_per_px * 10.0
+
+    # conversione
+    if to_units == "mm":
+        factor = px_to_mm
+    elif to_units == "cm":
+        factor = px_to_cm
+    elif to_units == "m":
+        factor = px_to_cm / 100.0
+    else:
+        raise ValueError("to_units deve essere 'mm', 'cm' o 'm'.")
+
+    verts = [(x*factor, y*factor) for (x, y) in verts_px]
+
+    poly = Polygon(verts).buffer(0)
+    if not poly.is_valid:
         raise ValueError("Boundary polygon is invalid")
-    return poly, prep(poly)                 # <- return both
+
+    meta = {
+        "scale_cm_per_px": s_cm_per_px,
+        "px_to_cm": px_to_cm,
+        "px_to_mm": px_to_mm,
+        "units": to_units,
+    }
+    return poly, prep(poly), meta
 
 
 ##############################################################################
