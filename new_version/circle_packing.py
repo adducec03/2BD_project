@@ -43,52 +43,83 @@ R = 9.0  # mm, radius of an 18650 seen from the top
 # ------------- 0. Parse command-line & input JSON --------------------------
 ##############################################################################
 
-def _detect_scale_cm_per_px(disegno: dict):
+def _detect_scale_px(disegno: dict):
     """
-    Ritorna il fattore cm/px se presente o ricavabile, altrimenti None.
+    Rileva i fattori di conversione px→mm e px→cm.
     Priorità:
-      1) disegno["scale_cm_per_px"]
-      2) mediana di (misure_cm[i] / misure_px[i]) se entrambe presenti
+      1) scale_mm_per_px (mm/px)   → px_to_mm
+      2) scale_cm_per_px (cm/px)   → px_to_cm
+      3) median(misure_mm / misure_px)
+      4) median(misure_cm / misure_px)
+    Ritorna: (px_to_mm, px_to_cm) oppure (None, None) se non ricavabile.
     """
-    s = disegno.get("scale_cm_per_px", None)
-    if isinstance(s, (int, float)) and s > 0:
-        return float(s)
+    def _to_float_list(seq):
+        out = []
+        for v in (seq or []):
+            try:
+                out.append(float(v))
+            except Exception:
+                pass
+        return out
 
-    cm = disegno.get("misure_cm")
-    px = disegno.get("misure_px")
-    if isinstance(cm, list) and isinstance(px, list) and len(cm) == len(px) and len(px) > 0:
-        pairs = [(float(c), float(p)) for c, p in zip(cm, px) if p and float(p) > 0]
+    # 1) scala esplicita mm/px
+    s_mm = disegno.get("scale_mm_per_px", None)
+    try:
+        s_mm = float(s_mm) if s_mm is not None else None
+    except Exception:
+        s_mm = None
+    if s_mm and s_mm > 0:
+        return float(s_mm), float(s_mm) / 10.0  # px→mm, px→cm
+
+    # 2) scala esplicita cm/px
+    s_cm = disegno.get("scale_cm_per_px", None)
+    try:
+        s_cm = float(s_cm) if s_cm is not None else None
+    except Exception:
+        s_cm = None
+    if s_cm and s_cm > 0:
+        return float(s_cm) * 10.0, float(s_cm)
+
+    # 3) misure_mm / misure_px
+    mm = _to_float_list(disegno.get("misure_mm"))
+    px = _to_float_list(disegno.get("misure_px"))
+    if mm and px and len(mm) == len(px):
+        pairs = [(m, p) for m, p in zip(mm, px) if p and float(p) > 0]
+        if pairs:
+            ratios = [m/p for m, p in pairs]  # mm/px
+            med = float(np.median(ratios))
+            return med, med / 10.0
+
+    # 4) misure_cm / misure_px
+    cm = _to_float_list(disegno.get("misure_cm"))
+    px = _to_float_list(disegno.get("misure_px"))
+    if cm and px and len(cm) == len(px):
+        pairs = [(c, p) for c, p in zip(cm, px) if p and float(p) > 0]
         if pairs:
             ratios = [c/p for c, p in pairs]  # cm/px
-            return float(np.median(ratios))
+            med = float(np.median(ratios))
+            return med * 10.0, med
 
-    # JSON vecchio → nessuna scala esplicita
-    return None
+    return None, None
+
 
 def load_boundary(json_path, to_units="mm", require_scale=False):
     """
-    Carica il poligono dal JSON e converte le coordinate da pixel alle unità desiderate.
-    - to_units: "mm" (default) | "cm" | "m"
-    - require_scale: se True e non c'è scala → solleva ValueError; se False → usa px come mm.
-
-    Ritorna: (poly_in_units, prepared_poly, meta_dict)
-      meta_dict contiene: {"px_to_mm":..., "px_to_cm":..., "scale_cm_per_px":...}
+    Carica il poligono e converte da px alle unità richieste.
+    Supporta scale in mm/px o cm/px (o deduzione da misure_mm / misure_cm).
     """
     data = json.loads(open(json_path, "r").read())
     disegno = json.loads(data["disegnoJson"])["disegno"]
 
     verts_px = [(float(v["x"]), float(v["y"])) for v in disegno["vertici"]]
-    s_cm_per_px = _detect_scale_cm_per_px(disegno)
 
-    if s_cm_per_px is None:
+    px_to_mm, px_to_cm = _detect_scale_px(disegno)
+    if px_to_mm is None or px_to_cm is None:
         if require_scale:
-            raise ValueError("Scala assente nel JSON (né scale_cm_per_px né misure_cm/misure_px).")
-        # fallback retro-compatibile: considera 1 px ≈ 1 mm
+            raise ValueError("Scala assente: né scale_mm_per_px/scale_cm_per_px né misure_mm/cm con misure_px.")
+        # fallback retro-compatibile: 1 px ≈ 1 mm
         px_to_mm = 1.0
         px_to_cm = 0.1
-    else:
-        px_to_cm = s_cm_per_px
-        px_to_mm = s_cm_per_px * 10.0
 
     # conversione
     if to_units == "mm":
@@ -101,13 +132,12 @@ def load_boundary(json_path, to_units="mm", require_scale=False):
         raise ValueError("to_units deve essere 'mm', 'cm' o 'm'.")
 
     verts = [(x*factor, y*factor) for (x, y) in verts_px]
-
     poly = Polygon(verts).buffer(0)
     if not poly.is_valid:
         raise ValueError("Boundary polygon is invalid")
 
     meta = {
-        "scale_cm_per_px": s_cm_per_px,
+        "scale_cm_per_px": px_to_cm,   # ora è il valore effettivo cm/px
         "px_to_cm": px_to_cm,
         "px_to_mm": px_to_mm,
         "units": to_units,

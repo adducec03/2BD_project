@@ -1,14 +1,12 @@
 import datetime
 import json
 import os
-import uuid
 import shutil
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
-import pandas as pd
 from fastapi import FastAPI, HTTPException, File, UploadFile
 from fastapi.responses import FileResponse
 
@@ -16,11 +14,9 @@ import circle_packing as cp
 import findBestConfiguration as fc
 import battery_layout_cpsat_v2 as bl
 from ortools.sat.python import cp_model
-from pack3d import build_glb_from_variant
 from build_battery_trimesh import convert_2d_to_3d
 from contact import attach_2d_contacts
-from thermal import save_thermal_png
-from thermal_pybamm import save_thermal_png_for_variant
+
 
 
 app = FastAPI()
@@ -35,27 +31,121 @@ THERMAL_DIR = os.path.join(OUTPUT_DIR, "thermal")
 os.makedirs(THERMAL_DIR, exist_ok=True)
 
 
+
+def _to_float_list(seq):
+    out = []
+    for v in (seq or []):
+        try:
+            out.append(float(v))
+        except Exception:
+            continue
+    return out
+
+def _normalize_disegno_obj(disegno: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(disegno, dict):
+        return {}
+
+    # scale: cm/px e mm/px
+    for key in ("scale_cm_per_px", "scale_mm_per_px"):
+        if key in disegno:
+            try:
+                disegno[key] = float(disegno.get(key))
+            except Exception:
+                disegno[key] = None
+
+    # misure: includi anche misure_mm
+    for key in ("misure", "misure_px", "misure_cm", "misure_mm"):
+        if key in disegno:
+            disegno[key] = _to_float_list(disegno.get(key))
+
+    # angoli
+    if "angoli" in disegno and isinstance(disegno["angoli"], list):
+        disegno["angoli"] = _to_float_list(disegno["angoli"])
+
+    # lines
+    if "lines" in disegno and isinstance(disegno["lines"], list):
+        norm_lines = []
+        for L in disegno["lines"]:
+            if not isinstance(L, dict):
+                continue
+            try:
+                norm_lines.append(dict(
+                    x1=float(L.get("x1")), y1=float(L.get("y1")),
+                    x2=float(L.get("x2")), y2=float(L.get("y2")),
+                ))
+            except Exception:
+                pass
+        disegno["lines"] = norm_lines
+
+    # vertici
+    if "vertici" in disegno and isinstance(disegno["vertici"], list):
+        norm_vert = []
+        for v in disegno["vertici"]:
+            if isinstance(v, dict) and "x" in v and "y" in v:
+                try:
+                    norm_vert.append({"x": float(v["x"]), "y": float(v["y"])})
+                except Exception:
+                    pass
+        disegno["vertici"] = norm_vert
+
+    return disegno
+
+def _normalize_outline_file_for_cp(input_path: str, out_dir: str = None) -> str:
+    """
+    Legge il file JSON originale, normalizza 'disegnoJson' e salva un nuovo file
+    pronto per cp.load_boundary. Ritorna il path del file normalizzato.
+    Se non trova/decodifica 'disegnoJson', ritorna il path originale.
+    """
+    out_dir = out_dir or os.path.dirname(os.path.abspath(input_path))
+    with open(input_path, "r", encoding="utf-8") as f:
+        incoming = json.load(f)
+
+    raw = incoming.get("disegnoJson")
+    if not raw:
+        # già compatibile (magari contiene direttamente 'polygon'/'vertices')
+        return input_path
+
+    # dise:gnoJson è una STRINGA contenente un JSON
+    try:
+        dj = json.loads(raw)
+    except Exception:
+        # non decodificabile → lascia stare
+        return input_path
+
+    # Il payload dell’app ha {"disegno": {...}}
+    disegno = dj.get("disegno") if isinstance(dj, dict) else None
+    if not isinstance(disegno, dict):
+        return input_path
+
+    disegno_norm = _normalize_disegno_obj(disegno)
+
+    # Riscrivi la stringa JSON normalizzata (mantengo la stessa struttura)
+    normalized_payload = {"disegno": disegno_norm}
+    incoming["disegnoJson"] = json.dumps(normalized_payload, ensure_ascii=False)
+
+    # Salva su file
+    base = os.path.splitext(os.path.basename(input_path))[0]
+    out_path = os.path.join(out_dir, f"{base}_normalized.json")
+    with open(out_path, "w", encoding="utf-8") as g:
+        json.dump(incoming, g, ensure_ascii=False)
+    return out_path
+
+
 # ------------------------- helper: lettura parametri batteria -------------------------
 def _read_battery_params(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Legge i campi attesi dal JSON d'ingresso (senza usare convert_file_json).
-    Mantiene compatibilità con chiavi già usate in precedenza.
-    """
     def _get(k, default=None):
         return raw.get(k, default)
 
-    # Chiavi attese (come in versione precedente)
-    total_voltage = int(_get("totalVoltage"))
-    total_current = int(_get("totalBatteryCurrent")) / 1000.0  # mA -> A
-    cell_voltage = int(_get("nominalVoltage"))
-    cell_current = int(_get("chargingCurrent"))  # Ah attesi? prima era semplicemente int
-    battery_type = _get("batteryType")           # es. "18650"
+    total_voltage = float(_get("totalVoltage"))
+    total_current = float(_get("totalBatteryCurrent")) / 1000.0  # mA -> A
+    cell_voltage  = float(_get("nominalVoltage"))                # es. 3.7
+    cell_current  = float(_get("chargingCurrent"))               # es. 1.5 (A)
+    battery_type  = _get("batteryType")  # "18650"
     if not battery_type or len(battery_type) < 4:
         raise HTTPException(status_code=400, detail="Campo 'batteryType' non valido.")
 
-    # parsing come prima: "18650" -> diam=18 mm, h=65.0 mm
     battery_diameter = int(battery_type[:2])
-    battery_height = int(battery_type[2:]) / 10.0
+    battery_height   = int(battery_type[2:]) / 10.0
 
     return dict(
         total_voltage=total_voltage,
@@ -328,19 +418,17 @@ def _estrai_gruppi_e_link(
 # ------------------------- pipeline principale -------------------------
 def elabora_dati(input_file_path: str):
 
-    # 0) leggo l’intero JSON di input (outline + parametri batteria)
-    with open(input_file_path, "r") as f:
+    # 0) leggo JSON e tengo una copia "incoming"
+    with open(input_file_path, "r", encoding="utf-8") as f:
         incoming = json.load(f)
-        polygon_points = incoming.get("polygon") or incoming.get("vertices") or []
-        polygon_points = _normalize_polygon(polygon_points) 
 
-    # outline file: uso direttamente lo stesso JSON come boundary per cp
-    json_outline_path = input_file_path
+    # Normalizza il file per cp.load_boundary (tollerante ai JSON dell'app)
+    json_outline_path = _normalize_outline_file_for_cp(input_file_path, out_dir=OUTPUT_DIR)
 
     # carico anche il poligono "geometrico" per eventuale fallback
-    poly, _ = cp.load_boundary(Path(json_outline_path))
+    poly, _, meta = cp.load_boundary(Path(json_outline_path))
 
-    # normalizzo i punti del poligono in formato semplice [[x,y],...]
+    # normalizzo eventuale poligono esplicito presente (se non c'è, useremo fallback da poly)
     polygon_points_norm = _normalize_polygon_points(
         incoming.get("polygon") or incoming.get("vertices") or [],
         fallback_poly=poly
@@ -348,13 +436,13 @@ def elabora_dati(input_file_path: str):
 
     # parametri batteria
     bp = _read_battery_params(incoming)
-    cell_voltage = bp["cell_voltage"]
-    cell_current = bp["cell_current"]     # Ah
-    total_voltage = bp["total_voltage"]
-    total_current = bp["total_current"]   # A
-    battery_type = bp["battery_type"]
+    cell_voltage   = bp["cell_voltage"]
+    cell_current   = bp["cell_current"]     # Ah (vedi nota sopra)
+    total_voltage  = bp["total_voltage"]
+    total_current  = bp["total_current"]    # A
+    battery_type   = bp["battery_type"]
     battery_diameter = bp["battery_diameter"]
-    battery_height = bp["battery_height"]
+    battery_height   = bp["battery_height"]
 
 
 
@@ -408,7 +496,7 @@ def elabora_dati(input_file_path: str):
             continue
 
         # Parametri solver (tieni i tuoi default preferiti)
-        time_budget = 120
+        time_budget = 30
         tol = 2.0
         degree_cap = 6
         enforce_degree = False
@@ -459,7 +547,7 @@ def elabora_dati(input_file_path: str):
         capacity_mAh_out = int(round((cell_info.get("capacity", cell_current)) * 1000.0))
 
         # battery_parameters completi (usa incoming se ha campi extra, altrimenti fallback sensati)
-        battery_id = incoming.get("id")
+        battery_id = incoming.get("id") or incoming.get("progettoId")
         total_voltage_out = float(total_voltage)
         total_battery_current_mA_out = float(total_current * 1000.0)
 
@@ -534,17 +622,7 @@ def elabora_dati(input_file_path: str):
         d_mm = int(round((cell_info.get("diameter") or battery_diameter)))
         h_mm = float((cell_info.get("height") or battery_height) * 10.0)
 
-        png_out = os.path.join(thermal_dir, f"thermal_{idx}.png")
-        save_thermal_png_for_variant(
-            variant_json_path=variant_json,
-            out_png_path=png_out,
-            d_mm=d_mm,
-            h_mm=h_mm,
-            pack_current_A=pack_I_A,
-            ambient_C=25.0,
-            soc0=0.6,
-            duration_s=300.0
-        )
+
 
         variant_glb = os.path.join(OUTPUT_DIR, f"battery3D_{idx}.glb")
         convert_2d_to_3d(
