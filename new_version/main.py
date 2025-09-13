@@ -270,23 +270,23 @@ def _compute_centres_with_cp(json_file: str, R: float) -> List[Tuple[float, floa
     """
     Implementa esattamente la pipeline richiesta con circle_packing.
     """
-    poly, _, meta = cp.load_boundary(Path(json_file), to_units="mm", require_scale=False)
+    poly, prep_poly, meta = cp.load_boundary(Path(json_file), to_units="mm", require_scale=False)
     print(f"[loader] units=mm, px->mm={meta['px_to_mm']:.5f}, scale_cm_per_px={meta['scale_cm_per_px']}")
 
-    centres = cp.best_hex_seed_two_angles(poly, n_phase=16)
+    centres = cp.best_hex_seed_two_angles(poly, r=R, n_phase=16)
     print("hex grid :", len(centres))
 
-    centres = cp.greedy_insert(poly, centres, trials=1000, max_pass=6)
+    centres = cp.greedy_insert(poly, centres, r=R, trials=1000, max_pass=6)
     print("after greedy :", len(centres))
 
     centres = cp.batch_bfgs_compact(centres, R, poly, n_pass=4)
     print("after compaction :", len(centres))
 
-    centres = cp.greedy_insert(poly, centres, trials=1000, max_pass=3)
+    centres = cp.greedy_insert(poly, centres, r=R, trials=1000, max_pass=3)
     print("final count :", len(centres))
 
     prev = len(centres)
-    centres = cp.skeleton_insert(poly, centres, step=2.0)
+    centres = cp.skeleton_insert(poly, centres, r=R, step=2.0)
     if len(centres) != prev:
         print("skeleton insert :", len(centres))
 
@@ -426,7 +426,7 @@ def elabora_dati(input_file_path: str):
     json_outline_path = _normalize_outline_file_for_cp(input_file_path, out_dir=OUTPUT_DIR)
 
     # carico anche il poligono "geometrico" per eventuale fallback
-    poly, _, meta = cp.load_boundary(Path(json_outline_path))
+    poly, prep_poly, meta = cp.load_boundary(Path(json_outline_path), to_units="mm", require_scale=False)
 
     # normalizzo eventuale poligono esplicito presente (se non c'è, useremo fallback da poly)
     polygon_points_norm = _normalize_polygon_points(
@@ -449,6 +449,7 @@ def elabora_dati(input_file_path: str):
 
     # 1) CIRCLE PACKING
     R = battery_diameter / 2.0
+    print(f"raggio cella: {R}")
     centres = _compute_centres_with_cp(json_outline_path, R)
     max_cells = len(centres)
     print("⭕️ numero massimo di celle:", max_cells)
@@ -496,7 +497,7 @@ def elabora_dati(input_file_path: str):
             continue
 
         # Parametri solver (tieni i tuoi default preferiti)
-        time_budget = 30
+        time_budget = 10
         tol = 2.0
         degree_cap = 6
         enforce_degree = False
