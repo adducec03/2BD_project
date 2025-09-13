@@ -1,8 +1,6 @@
 import circle_packing as cp
 import starting_k_grouping as kg
 import series_ordering as so
-import parallel_plate as pp
-import series_plate as sp
 import thermo as st
 
 
@@ -11,7 +9,7 @@ from shapely.geometry import Point, Polygon, LineString
 import numpy as np
 import networkx as nx
 import matplotlib.pyplot as plt
-
+import csv
 
 
 
@@ -22,13 +20,13 @@ if __name__ == "__main__":
                             #Variables
     ###########################################################
 
-    json_file = "new_version/input_3.json"  # Path to the input JSON file
+    json_file = "others/new_version/input_json/input_4.json"  # Path to the input JSON file
     out_csv = "new_version/out.csv"
     R = 9.0  # mm, radius of an 18650 seen from the top
-    EPS = 0.2          # slack in adjacency threshold
-    S = 40
-    P = 10
-
+    EPS = 5.0          # slack in adjacency threshold
+    S = 10
+    P = 26
+ 
 
 
 
@@ -42,7 +40,7 @@ if __name__ == "__main__":
     ###########################################################
 
  # --------------------------------------------------- load outline ----
-    poly, _ = cp.load_boundary(Path(json_file))
+    poly, _, meta = cp.load_boundary(Path(json_file))
 
     # 1 ─ aligned hex grid (finer phase scan gives 1-3 extra cells)
     centres = cp.best_hex_seed_two_angles(poly, n_phase=16)
@@ -112,22 +110,27 @@ if __name__ == "__main__":
     N_all = len(centres_all)
 
     # ----- SELECT EXACTLY S*P CELLS ------------------------------------
-    keep_mask = kg.drop_periphery_iterative(centres_all, S*P)
+    keep_mask = kg.drop_periphery_iterative(centres_all, S*P, R ,EPS)
     centres   = centres_all[keep_mask]        # array of shape (S*P,2)
     print(f"Kept {len(centres)} cells, discarded {N_all-len(centres)} extras")
 
     # -------------------------------------------------------------------
-    G   = kg.build_contact_graph(centres)        # only those kept cells
+    G   = kg.build_contact_graph(centres, R, EPS)        # only those kept cells
+
+    fig, ax = kg.plot_contact_graph_unweighted(centres, R, EPS,
+                                  edge_lw=1.0, edge_color="0.4",
+                                  node_ec="k", node_fc="white", node_lw=0.6,
+                                  figsize=(7,7), title=None)
+    plt.show()
     
 
     kg.rb_exact_partition.gid_counter = 0
     part_of = kg.rb_exact_partition(G, list(G.nodes()), P)
 
-    group_color = kg.color_groups_avoiding_adjacent(G, part_of, S)
-
+    group_color = kg.build_series_palette(S)
 
     # ----- PLOT ---------------------------------------------------------
-    kg.plot_groups(poly, centres, part_of, S, group_color=group_color, title=f"S={S}, P={P} (adjacency-colored)")
+    kg.plot_groups(poly, centres, part_of, S, group_color=group_color, title=None)
     # ----------------------------------------------------------------------
 
 
@@ -149,7 +152,7 @@ if __name__ == "__main__":
     #order, segments = so.series_order_adjacent_walk(G, centres, part_of, S, prefer='near')
 
 
-    order, group_edges = so.series_order_ortools(G, centres, part_of, beta=0.05, time_limit_s=5)
+    order, group_edges = so.series_order_ortools(G, centres, part_of, beta=0.01, time_limit_s=5)
     print("Series order:", order)
     # Optional polarity (+1, -1 alternating)
     polarity = {g: (1 if i % 2 == 0 else -1) for i, g in enumerate(order)}
@@ -157,7 +160,89 @@ if __name__ == "__main__":
 
     # Plot
     group_color = kg.color_groups_avoiding_adjacent(G, part_of, S)
-    so.plot_series_order(poly, centres, part_of, S, order, R=R)
+    so.plot_series_order(poly, centres, part_of, S, order,
+                  order_label_size=25, order_marker_size=7, order_line_width=2.0)
+
+
+
+
+
+    #######################################################################################
+                                        #PROVA TESI
+    #This module is used to make a thermal analysis based on the specific battery topology
+    #######################################################################################
+
+
+    tm = kg.Timer()
+
+    # ---- selezione celle (drop periphery) ----
+    tm.start("drop")
+    keep_mask = kg.drop_periphery_iterative(centres_all, S*P, R, EPS)
+    t_drop = tm.stop("drop")
+
+    centres = centres_all[keep_mask]
+    N_all, N_keep = len(centres_all), len(centres)
+
+    # ---- grafo di contatto ----
+    tm.start("graph")
+    G = kg.build_contact_graph(centres, R, EPS)
+    t_graph = tm.stop("graph")
+
+    # ---- partizionamento (METIS ricorsivo non pesato) ----
+    kg.rb_exact_partition.gid_counter = 0
+    tm.start("partition")
+    part_of = kg.rb_exact_partition(G, list(G.nodes()), P)
+    t_part = tm.stop("partition")
+
+    # ---- statistiche interfacce e gruppi spezzati ----
+    cstats = kg.contact_stats(G, part_of, S)
+    splits, comp_count = kg.split_groups(G, part_of, S)
+    num_split_groups = len(splits)
+
+    # ---- ordinamento in serie (se vuoi misurare anche questo) ----
+    tm.start("series")
+    order, group_edges = so.series_order_ortools(G, centres, part_of, beta=0.05, time_limit_s=5)
+    t_series = tm.stop("series")
+
+    W, _ = kg.compute_group_interfaces(G, part_of, S)  # matrice interfacce tra gruppi
+
+    contacts_in_path = [W[a, b] for (a, b) in group_edges]
+
+    print("Collo di bottiglia (min):", min(contacts_in_path))
+    print("Media interfacce:", np.mean(contacts_in_path))
+    print("Massimo interfacce:", max(contacts_in_path))
+    print("Connessioni a singolo contatto:", sum(1 for c in contacts_in_path if c == 1))
+
+    # ---- stampa riepilogo console ----
+    print("\n=== Riepilogo approccio preliminare ===")
+    print(f"Celle totali iniziali: {N_all}  |  mantenute: {N_keep} (= S*P = {S*P})")
+    print(f"Tempo drop-periphery:  {t_drop:.3f} s")
+    print(f"Tempo grafo contatto:  {t_graph:.3f} s")
+    print(f"Tempo partizionamento: {t_part:.3f} s")
+    print(f"Tempo serie (routing): {t_series:.3f} s")
+    print("--- Interfacce tra gruppi ---")
+    for k, v in cstats.items():
+        print(f"{k}: {v}")
+    print(f"Gruppi spezzati: {num_split_groups}  -> {splits}")
+    print("\n\n\n")
+
+    # ---- (opzionale) salva CSV per tabella in tesi ----
+    with open("prelim_results_summary.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["metric", "value"])
+        w.writerow(["cells_initial", N_all])
+        w.writerow(["cells_kept", N_keep])
+        w.writerow(["time_drop_s", f"{t_drop:.6f}"])
+        w.writerow(["time_graph_s", f"{t_graph:.6f}"])
+        w.writerow(["time_partition_s", f"{t_part:.6f}"])
+        w.writerow(["time_series_s", f"{t_series:.6f}"])
+        w.writerow(["interfaces_total", cstats["interfaces_total"]])
+        w.writerow(["interfaces_mean", f"{cstats['interfaces_mean']:.3f}"])
+        w.writerow(["interfaces_min", cstats["interfaces_min"]])
+        w.writerow(["interfaces_max", cstats["interfaces_max"]])
+        w.writerow(["interfaces_num_pairs", cstats["interfaces_num_pairs"]])
+        w.writerow(["num_single_contact_pairs", cstats["num_single_contact_pairs"]])
+        w.writerow(["num_split_groups", num_split_groups])
 
 
 
@@ -169,43 +254,14 @@ if __name__ == "__main__":
 
 
 
-    ##########################################################################
-                                #Plates design
-    #This module is used to design plates for parallel and series connections.
-    ##########################################################################
-
-    #-----------------------------------Parallel------------------------------
-    plates = pp.make_all_plates(G, centres, part_of, S,
-                                R=R, land=1.2, gap=2.0, outline=poly, res=64)
-    plates = {g: pp.smooth_plate(poly, r_open=3, r_close=1, gap=2.0, safety=0.10)
-          for g, poly in plates.items()}
-    #plate = npb.smooth_plate(plates, r_open=0.8, r_close=0.4, gap=2.0, safety=0.10)
-    welds  = pp.weld_points_all(G, centres, part_of, S, R=R, offset=2.6)
-    # Plot
-    pp.plot_plates(poly, centres, part_of, S, plates, welds, R=R,
-                title=f"Nickel plates per group (S={S}, P={P}) – disjoint")
 
 
-    #-----------------------------------Series--------------------------------
-    # known:
-    #   plates : dict {group -> shapely Polygon}  (parallel plates, disjoint)
-    #   part_of, centres, S
-    #   order  : list of group-ids from OR-Tools path
-    #   I_pack : (estimated) peak pack current
-
-    group_edges = [(order[i], order[i+1]) for i in range(len(order)-1)]
 
 
-    bridges = sp.make_series_band_from_cells(
-        G, centres, part_of, group_edges,
-        R=9.0,
-        rows=1,        # try 2–3 to match your photo (more rows ⇒ wider plate)
-        inset=0.6,
-        smooth=1.0,
-        clip_poly=poly
-    )
 
-    sp.plot_series_plates_over_cells(poly, centres, part_of, S, bridges, R=9.0)
+
+
+
 
 
     #######################################################################################

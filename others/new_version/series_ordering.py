@@ -129,7 +129,13 @@ def series_order_ortools(G, centres, part_of,
 
 # ---------- Plotting ----------------------------------------------------------
 
-def plot_series_order(poly, centres, part_of, S, order, group_color=None, R=9.0):
+def plot_series_order(poly, centres, part_of, S, order,
+                      group_color=None, R=9.0,
+                      order_label_size=14,        # <<< dimensione numeri
+                      order_marker_size=6,        # cerchietti sulla polilinea
+                      order_line_width=1.6,       # spessore linea
+                      order_label_face='black',   # sfondo etichetta
+                      order_label_alpha=0.65):    # opacità sfondo
     """
     Plot groups (filled) and overlay the series order by drawing lines between group centroids.
     """
@@ -141,27 +147,34 @@ def plot_series_order(poly, centres, part_of, S, order, group_color=None, R=9.0)
             import colorcet as cc
             palette = [mpl.colors.to_rgb(c) for c in cc.glasbey]
         except Exception:
-            palette = [cm.tab20(i%20) for i in range(S)]
+            palette = [cm.tab20(i % 20) for i in range(S)]
         group_color = {g: palette[g % len(palette)] for g in range(S)}
 
+    # Celle
     for i, (x, y) in enumerate(centres):
         g = part_of[i] if isinstance(part_of, dict) else part_of[i]
         ax.add_patch(plt.Circle((x, y), R, facecolor=group_color[g], edgecolor='k', lw=0.4))
 
+    # Centroidi
     C = group_centroids(centres, part_of, S)
-    xs = [C[g,0] for g in order]
-    ys = [C[g,1] for g in order]
-    ax.plot(xs, ys, '-o', color='black', lw=1.2, ms=3, alpha=0.85, zorder=3)
+    xs = [C[g, 0] for g in order]
+    ys = [C[g, 1] for g in order]
 
+    # Polilinea dell'ordine di serie
+    ax.plot(xs, ys, '-o', color='black', lw=order_line_width, ms=order_marker_size, alpha=0.9, zorder=3)
+
+    # Etichette grandi (1,2,3,...) sui centroidi nell'ordine
     for k, g in enumerate(order):
-        ax.text(C[g,0], C[g,1], f"{k+1}",
+        ax.text(C[g, 0], C[g, 1], f"{k+1}",
                 ha='center', va='center',
-                fontsize=7, color='white', weight='bold',
-                bbox=dict(boxstyle='circle,pad=0.2', fc='black', alpha=0.6),
+                fontsize=order_label_size,          # <<< qui la dimensione
+                color='white', weight='bold',
+                bbox=dict(boxstyle='circle,pad=0.25',
+                          fc=order_label_face, alpha=order_label_alpha),
                 zorder=4)
 
     ax.set_aspect('equal'); ax.axis('off')
-    ax.set_title(f"Series order (S={S})")
+    ax.set_title(None)
     plt.tight_layout(); plt.show()
 
 def plot_series_order2(poly, centres, part_of, S, order, group_color=None, R=9.0):
@@ -199,5 +212,5 @@ def plot_series_order2(poly, centres, part_of, S, order, group_color=None, R=9.0
                 bbox=dict(boxstyle='circle,pad=0.2', fc='black', alpha=0.6), zorder=4)
 
     ax.set_aspect('equal'); ax.axis('off')
-    ax.set_title(f"Series order (S={S})")
+    ax.set_title(None)
     plt.tight_layout(); plt.show()
