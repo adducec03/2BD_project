@@ -1,10 +1,12 @@
 # Ignora file con estensioni specifiche
-#*.json
-*.glb
-*.zip
+input.json
+out.csv
 
 # Ignora cartelle specifiche
 __pycache__/
 json_valeria/
 json_chat/
 tmp/
+new_version/outputs/
+test/
+
