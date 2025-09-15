@@ -57,6 +57,78 @@ import numpy.linalg as npl
 from ortools.sat.python import cp_model
 
 
+
+def add_unused_component_forest(
+    model,
+    N,
+    A_dir,           # archi diretti aciclici (da build_acyclic_arcs)
+    incoming,        # incoming[v] = lista archi (u->v)
+    use,             # dict: use[i] ∈ {0,1} già nel tuo modello
+    boundary_mask,   # np.array di 0/1: 1 = cella di bordo
+    mode="penalize", # "penalize" | "forbid"
+):
+    """
+    Costruisce una foresta sulle celle NON assegnate U[i] = 1 - use[i].
+    - Se mode="forbid": vieta componenti interne (nessuna radice ammessa dentro).
+    - Se mode="penalize": consente radici interne ma le segnala per la penalità.
+
+    Ritorna:
+      vars: dict con chiavi:
+        "U":  dict[i] -> IntVar {0,1}
+        "yH": dict[(u,v)] -> BoolVar, archi della foresta sui non-assegnati
+        "rH": dict[i] -> BoolVar, radici di componente sui non-assegnati
+        "n_holes": IntVar (solo in mode="penalize"), #componenti interne
+    """
+    # U[i] = 1 - use[i]
+    U = {i: model.NewIntVar(0, 1, f"U[{i}]") for i in range(N)}
+    for i in range(N):
+        model.Add(U[i] == 1 - use[i])
+
+    # Archi sulla foresta dei non-assegnati
+    yH = {}
+    for (u, v) in A_dir:
+        y = model.NewBoolVar(f"yH[{u}->{v}]")
+        # attivo solo se entrambi i nodi sono non-assegnati
+        model.Add(y <= U[u])
+        model.Add(y <= U[v])
+        yH[(u, v)] = y
+
+    # Radici (una per componente): preferibilmente sul bordo
+    rH = {i: model.NewBoolVar(f"rH[{i}]") for i in range(N)}
+    for i in range(N):
+        model.Add(rH[i] <= U[i])  # puoi essere root solo se non-assegnato
+        if mode == "forbid":
+            # vieta radici interne: obbliga ogni componente a toccare il bordo
+            if int(boundary_mask[i]) == 0:
+                model.Add(rH[i] == 0)
+
+    # Bilancio per ogni nodo: somma incoming + root = U[i]
+    for i in range(N):
+        model.Add(sum(yH[(u, i)] for (u, _v) in incoming[i]) + rH[i] == U[i])
+
+    # In una foresta: #archi = #nodi - #radici
+    model.Add(sum(yH.values()) == sum(U[i] for i in range(N)) - sum(rH[i] for i in range(N)))
+
+    out = {"U": U, "yH": yH, "rH": rH}
+
+    if mode == "penalize":
+        # Conta quante radici sono in celle INTERNE (cioè componenti senza bordo)
+        int_roots = []
+        for i in range(N):
+            if int(boundary_mask[i]) == 0:
+                si = model.NewBoolVar(f"intRoot[{i}]")
+                model.Add(si == rH[i])      # s[i] = rH[i] se non di bordo
+                int_roots.append(si)
+        n_holes = model.NewIntVar(0, N, "n_hole_components")
+        if int_roots:
+            model.Add(n_holes == sum(int_roots))
+        else:
+            model.Add(n_holes == 0)
+        out["n_holes"] = n_holes
+
+    return out
+
+
 def add_row_block_stripes(model, x, S, P,
                           row_of, pos_in_row, rows, row_counts):
     """
@@ -764,22 +836,62 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
     neighbors = {i: [] for i in range(N)}
     for (i, j) in E:
         neighbors[i].append(j); neighbors[j].append(i)
-    interior_idx = [i for i in range(N) if len(neighbors[i]) == 6]
+
+    # (consigliato) bordo = grado < max_deg osservato
+    max_deg = max((len(neighbors[i]) for i in range(N)), default=0)
+    boundary_mask = np.array([1 if len(neighbors[i]) < max_deg else 0 for i in range(N)], dtype=int)
 
     # === model & variabili ===
     model = cp_model.CpModel()
-    rng = np.random.default_rng(seed)
 
+    # x, r
     x, r = {}, {}
     for i in range(N):
         for k in range(S):
             x[(i,k)] = model.NewBoolVar(f"x[{i},{k}]")
             r[(i,k)] = model.NewBoolVar(f"r[{i},{k}]")
 
+    # use[i] = Σ_k x[i,k]
     use = {}
     for i in range(N):
         use[i] = model.NewIntVar(0, 1, f"use[{i}]")
         model.Add(use[i] == sum(x[(i,k)] for k in range(S)))
+
+    # --- exp[i] = cella esposta (bordo oppure ha almeno un vicino non usato) ---
+    exp, outN = {}, {}
+    for i in range(N):
+        e = model.NewBoolVar(f"exp[{i}]")
+        if boundary_mask[i] == 1:
+            model.Add(e == 1)
+        else:
+            if neighbors[i]:
+                oi = model.NewBoolVar(f"outN[{i}]")
+                for j in neighbors[i]:
+                    model.Add(oi >= 1 - use[j])                # se un vicino è vuoto → oi può essere 1
+                model.Add(oi <= sum(1 - use[j] for j in neighbors[i]))  # upper bound
+                model.Add(e == oi)
+                outN[i] = oi
+            else:
+                model.Add(e == 1)  # cella isolata: esposta
+        exp[i] = e
+
+    # --- esposizione gruppi agli estremi della catena (k=0 e k=S-1) ---
+    end_groups = [0] if S == 1 else [0, S-1]
+    g_exposed = {}
+    for k_end in end_groups:
+        eik = []
+        for i in range(N):
+            ei = model.NewBoolVar(f"exp_in_grp[{k_end},{i}]")
+            model.Add(ei <= x[(i, k_end)])
+            model.Add(ei <= exp[i])
+            model.Add(ei >= x[(i, k_end)] + exp[i] - 1)  # AND
+            eik.append(ei)
+        gk = model.NewBoolVar(f"group_exposed[{k_end}]")
+        if eik:
+            model.AddMaxEquality(gk, eik)  # OR sugli ei
+        else:
+            model.Add(gk == 0)
+        g_exposed[k_end] = gk
 
     # (1) gruppi da P celle, (2) ogni cella al più una volta, (3) una root per gruppo
     for k in range(S):
@@ -832,26 +944,26 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
     for k in range(S):
         model.Add(sum(y[(i, j, k)] for (i, j) in A) == sum(x[(i, k)] for i in range(N)) - 1)
 
-     # --- Rilevazione "buco": cella non assegnata con TUTTI i vicini assegnati ---
-    holes = []   # lista di h[i] da penalizzare
-    if use_hole_penality:
-        for i in interior_idx:
-            # g[i] = AND_{j in N(i)} use[j]
-            gi = model.NewBoolVar(f"allN_used[{i}]")
-            # g <= use[j] per tutti i vicini
-            for j in neighbors[i]:
-                model.Add(gi <= use[j])
-            # g >= sum(use[j]) - (m-1), con m = grado(i)
-            m = len(neighbors[i])  # qui m=6
-            model.Add(gi >= sum(use[j] for j in neighbors[i]) - (m - 1))
 
-            # h[i] = (1 - use[i]) AND gi
-            hi = model.NewBoolVar(f"hole[{i}]")
-            model.Add(hi <= 1 - use[i])
-            model.Add(hi <= gi)
-            # h >= gi + (1 - use[i]) - 1  →  h >= gi - use[i]
-            model.Add(hi >= gi - use[i])
-            holes.append(hi)
+    # --- Single-cell holes (opzionale): definisci sempre holes per evitare NameError ---
+    holes = []   # sarà una lista di BoolVar; se non usata resta vuota
+
+
+
+
+    # ------ NUOVO: buco multi-cella (componenti interne dei NON-assegnati) ------
+    HOLE_MODE = "penalize"   # "forbid" per vietarli del tutto
+    hole_vars = add_unused_component_forest(
+        model,
+        N=N,
+        A_dir=A,             # DAG che hai già costruito con build_acyclic_arcs
+        incoming=incoming,
+        use=use,
+        boundary_mask=boundary_mask,
+        mode=HOLE_MODE
+    )
+
+            
 
 
     # --- (5) Link tra gruppi consecutivi (z1/z2) su TUTTI gli archi E ---
@@ -887,25 +999,44 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
 
 
 
-   # --- Obiettivo: copertura, minimo T, somma contatti, penalità buchi ---
+    # --- Obiettivo: copertura, minimo T, somma contatti, penalità ---
     T = None
     if L:
+        # b[k] = 1 se Lk >= 1
         b = []
         for k, Lk in enumerate(L):
             bk = model.NewBoolVar(f"connected[{k}]")
             model.Add(Lk >= bk)
             b.append(bk)
 
-        T = model.NewIntVar(0, 2*P, "T_min_links")
+        # T = min_k Lk
+        T = model.NewIntVar(0, 2 * P, "T_min_links")
         for Lk in L:
             model.Add(T <= Lk)
 
+        # pesi
         wCover, wT, wSum = 10_000, 1_000, 100
-        wHole = 300   # <<< peso penalità buchi (puoi tararlo)
-        if holes:
-            model.Maximize(wCover * sum(b) + wT * T + wSum * sum(L) - wHole * sum(holes))
-        else:
-            model.Maximize(wCover * sum(b) + wT * T + wSum * sum(L))
+        wHole1     = 150    # micro-buchi (se attivati)
+        wHoleComp  = 600    # componenti interne non-assegnate
+        wEndExpose = 2_000  # estremi non esposti
+
+        # base
+        obj = wCover * sum(b) + wT * T + wSum * sum(L)
+
+        # penalità estremi non esposti
+        for k_end in end_groups:
+            obj -= wEndExpose * (1 - g_exposed[k_end])
+
+        # penalità componenti interne dei NON-assegnati (se hai chiamato add_unused_component_forest)
+        hole_comp_term = hole_vars.get("n_holes") if 'hole_vars' in locals() else None
+        if hole_comp_term is not None:
+            obj -= wHoleComp * hole_comp_term
+
+        # penalità micro-buchi singoli (se attivata)
+        if use_hole_penality and 'holes' in locals() and holes:
+            obj -= wHole1 * sum(holes)
+
+        model.Maximize(obj)
     else:
         model.Maximize(0)
 

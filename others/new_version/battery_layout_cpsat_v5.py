@@ -57,6 +57,102 @@ import numpy.linalg as npl
 from ortools.sat.python import cp_model
 
 
+
+
+def _score_pack(status, solver, L, T):
+    """Valuta una run: objective reale come metrica primaria, poi (T, sumL)."""
+    from ortools.sat.python import cp_model
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return (-1e18, -1, -1)
+    try:
+        obj = solver.ObjectiveValue()
+    except Exception:
+        obj = -1e18
+    tval = solver.Value(T) if T is not None else -1
+    sumL = sum(int(solver.Value(Lk)) for Lk in L) if L else -1
+    return (obj, tval, sumL)
+
+def build_warm_start(solver, x):
+    """Estrae una mappa {(i,k):0/1} dalla soluzione corrente per AddHint."""
+    hint = {}
+    for (i,k), var in x.items():
+        try:
+            hint[(i,k)] = 1 if solver.BooleanValue(var) else 0
+        except Exception:
+            hint[(i,k)] = 0
+    return hint
+
+def add_unused_component_forest(
+    model,
+    N,
+    A_dir,           # archi diretti aciclici (da build_acyclic_arcs)
+    incoming,        # incoming[v] = lista archi (u->v)
+    use,             # dict: use[i] ∈ {0,1} già nel tuo modello
+    boundary_mask,   # np.array di 0/1: 1 = cella di bordo
+    mode="penalize", # "penalize" | "forbid"
+):
+    """
+    Costruisce una foresta sulle celle NON assegnate U[i] = 1 - use[i].
+    - Se mode="forbid": vieta componenti interne (nessuna radice ammessa dentro).
+    - Se mode="penalize": consente radici interne ma le segnala per la penalità.
+
+    Ritorna:
+      vars: dict con chiavi:
+        "U":  dict[i] -> IntVar {0,1}
+        "yH": dict[(u,v)] -> BoolVar, archi della foresta sui non-assegnati
+        "rH": dict[i] -> BoolVar, radici di componente sui non-assegnati
+        "n_holes": IntVar (solo in mode="penalize"), #componenti interne
+    """
+    # U[i] = 1 - use[i]
+    U = {i: model.NewIntVar(0, 1, f"U[{i}]") for i in range(N)}
+    for i in range(N):
+        model.Add(U[i] == 1 - use[i])
+
+    # Archi sulla foresta dei non-assegnati
+    yH = {}
+    for (u, v) in A_dir:
+        y = model.NewBoolVar(f"yH[{u}->{v}]")
+        # attivo solo se entrambi i nodi sono non-assegnati
+        model.Add(y <= U[u])
+        model.Add(y <= U[v])
+        yH[(u, v)] = y
+
+    # Radici (una per componente): preferibilmente sul bordo
+    rH = {i: model.NewBoolVar(f"rH[{i}]") for i in range(N)}
+    for i in range(N):
+        model.Add(rH[i] <= U[i])  # puoi essere root solo se non-assegnato
+        if mode == "forbid":
+            # vieta radici interne: obbliga ogni componente a toccare il bordo
+            if int(boundary_mask[i]) == 0:
+                model.Add(rH[i] == 0)
+
+    # Bilancio per ogni nodo: somma incoming + root = U[i]
+    for i in range(N):
+        model.Add(sum(yH[(u, i)] for (u, _v) in incoming[i]) + rH[i] == U[i])
+
+    # In una foresta: #archi = #nodi - #radici
+    model.Add(sum(yH.values()) == sum(U[i] for i in range(N)) - sum(rH[i] for i in range(N)))
+
+    out = {"U": U, "yH": yH, "rH": rH}
+
+    if mode == "penalize":
+        # Conta quante radici sono in celle INTERNE (cioè componenti senza bordo)
+        int_roots = []
+        for i in range(N):
+            if int(boundary_mask[i]) == 0:
+                si = model.NewBoolVar(f"intRoot[{i}]")
+                model.Add(si == rH[i])      # s[i] = rH[i] se non di bordo
+                int_roots.append(si)
+        n_holes = model.NewIntVar(0, N, "n_hole_components")
+        if int_roots:
+            model.Add(n_holes == sum(int_roots))
+        else:
+            model.Add(n_holes == 0)
+        out["n_holes"] = n_holes
+
+    return out
+
+
 def add_row_block_stripes(model, x, S, P,
                           row_of, pos_in_row, rows, row_counts):
     """
@@ -78,7 +174,7 @@ def add_row_block_stripes(model, x, S, P,
 
     # 2) ogni riga al più un gruppo (se vuoi imporre copertura perfetta quando S==R, cambia in ==1)
     for r in range(R):
-        model.Add(sum(y[(r,k)] for k in range(S)) <= 1)
+        model.AddAtMostOne([y[(r,k)] for k in range(S)])
 
     # 3) Prepara mapping riga→lista (ordinata) di (pos, cell_index)
     by_row = {r: [] for r in range(R)}
@@ -206,7 +302,7 @@ def add_hex_column_block_stripes(model, x, S, P,
     for k in range(S):
         model.Add(sum(y[(c,k)] for c in range(C_complete)) == 1)
     for c in range(C_complete):
-        model.Add(sum(y[(c,k)] for k in range(S)) <= 1)
+        model.AddAtMostOne([y[(c,k)] for k in range(S)])
 
     # opzionale: colonne consecutive e in ordine
     if force_consecutive_cols:
@@ -313,7 +409,7 @@ def add_stripe_constraints(model, x, S, P,
             if must_cover_all_stripes and S == n_cols:
                 model.Add(sum(y[(c,k)] for k in range(S)) == 1)
             else:
-                model.Add(sum(y[(c,k)] for k in range(S)) <= 1)
+                model.AddAtMostOne([y[(c,k)] for k in range(S)])
         # celle vincolate: le celle della colonna c possono andare solo al gruppo k collegato a c
         idx_by_col = {c: [i for i in range(N) if col_of[i] == c] for c in range(n_cols)}
         for c in range(n_cols):
@@ -331,7 +427,7 @@ def add_stripe_constraints(model, x, S, P,
             if must_cover_all_stripes and S == n_rows:
                 model.Add(sum(y[(r,k)] for k in range(S)) == 1)
             else:
-                model.Add(sum(y[(r,k)] for k in range(S)) <= 1)
+                model.AddAtMostOne([y[(r,k)] for k in range(S)])
         idx_by_row = {r: [i for i in range(N) if row_of[i] == r] for r in range(n_rows)}
         for r in range(n_rows):
             for k in range(S):
@@ -359,49 +455,138 @@ def make_profile(profile_name: str, time_s: float, seed: int, workers: int):
 
 def auto_tune_and_solve(coords, S, P, R, tol,
                         time_budget=60,
-                        target_T=None,     # metti <= 2*P, altrimenti None
+                        target_T=None,     # <= 2*P consigliato
                         degree_cap=6,
                         enforce_degree=False,
                         profiles=("fast","fast","quality"),
                         seeds=(0,1,2,3),
                         workers=6,
-                        use_hole_penality=False, stripe_mode="auto"):
-    combos = []
-    for t in range(max(len(profiles), len(seeds))):
-        combos.append( (profiles[t % len(profiles)], seeds[t % len(seeds)]) )
+                        use_hole_penality=False,
+                        stripe_mode="auto"):
+    """
+    Racing adattivo (successive halving) + polishing finale con warm-start.
+    """
+    from ortools.sat.python import cp_model
 
-    per_run = max(5, time_budget // max(1, len(combos)))
-    best_pack, best_T, best_sumL = None, -1, -1
+    def precompute_static(coords, R, tol, stripe_mode):
+            E, _ = build_graph(coords, R, tol)
+            e1, e2 = pca_axes(coords)
+            row_of_h, pos_in_row_h, rows_h, row_counts_h, C_complete_h = _infer_rows_and_positions_hex(coords, E)
+            rect_like = is_quadrangular_by_rows(row_counts_h)
+            can_hex_cols = (stripe_mode in ("auto","columns")) and rect_like and (len(rows_h) >= P) and (C_complete_h >= S)
+            orient_axis = e2 if can_hex_cols else e1
+            A, incoming = build_acyclic_arcs(coords, E, orient_axis=orient_axis)
+            return dict(E=E, e1=e1, e2=e2,
+                        row_of_h=row_of_h, pos_in_row_h=pos_in_row_h, rows_h=rows_h,
+                        row_counts_h=row_counts_h, C_complete_h=C_complete_h,
+                        can_hex_cols=can_hex_cols, orient_axis=orient_axis, A=A, incoming=incoming)
 
-    # cap target_T a 2*P (limite realistico)
-    if target_T is not None:
-        target_T = min(target_T, 2*P)
+    pre = precompute_static(coords, R, tol, stripe_mode)
 
-    for (prof, seed) in combos:
-        cp_params = make_profile(prof, per_run, seed, workers)
+    # costruiamo la lista iniziale di candidati
+    base_combos = [(p, s) for p in profiles for s in seeds]
+    if not base_combos:
+        base_combos = [("fast", 0)]
 
-        status, solver, x, r, L, z1, z2, E, T = solve_layout(
-            coords, S, P, R, tol,
-            time_limit=per_run, alpha=0.0, Lmin=1,
-            degree_cap=degree_cap, enforce_degree=enforce_degree,
-            cp_params=cp_params, use_hole_penality=False,
-            stripe_mode=stripe_mode
-        )
-
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            tval = solver.Value(T) if T is not None else 0
-            sumL = sum(int(solver.Value(Lk)) for Lk in L)
-            if (tval > best_T) or (tval == best_T and sumL > best_sumL):
-                best_pack = (status, solver, x, r, L, z1, z2, E, T)
-                best_T, best_sumL = tval, sumL
-            if target_T is not None and tval >= target_T:
-                break
-
-    # se nessuna run è FEASIBLE/OPTIMAL, ritorna l’ultima (best_pack resta None)
-    if best_pack is not None:
-        return best_pack
+    # suddivisione budget in round (più tempo agli ultimi)
+    if len(base_combos) == 1:
+        fractions = [1.0]
     else:
-        return status, solver, x, r, L, z1, z2, E, T
+        fractions = [0.30, 0.30, 0.40]  # 3 round; adatta se vuoi
+
+    candidates = base_combos[:]
+    best_pack = None
+    best_obj, best_T, best_sumL = -1e18, -1, -1
+    warm_start = None
+    last_pack = None  # in caso non troviamo nulla di FEASIBLE
+
+    # helper per early-stop su target_T realistico
+    if target_T is not None:
+        target_T = min(target_T, 2 * P)
+
+    
+    # --- rounds ---
+    for r_idx, frac in enumerate(fractions):
+        per_run = max(5, int((time_budget * frac) / max(1, len(candidates))))
+        runs = []
+
+        for (prof, seed) in candidates:
+            cp_params = make_profile(prof, per_run, seed, workers)
+            status, solver, x, rvars, L, z1, z2, E, T = solve_layout(
+                coords, S, P, R, tol,
+                time_limit=per_run,
+                alpha=0.0, Lmin=1,
+                degree_cap=degree_cap,
+                enforce_degree=enforce_degree,
+                cp_params=cp_params,
+                use_hole_penality=use_hole_penality,
+                stripe_mode=stripe_mode,
+                warm_start=warm_start,
+                pre=pre
+            )
+            last_pack = (status, solver, x, rvars, L, z1, z2, E, T)
+
+            obj, tval, sumL = _score_pack(status, solver, L, T)
+
+            print({
+                "round": r_idx,
+                "profile": prof,
+                "seed": seed,
+                "per_run_s": per_run,
+                "obj": obj,
+                "T": tval,
+                "sumL": sumL,
+                "wall_s": solver.WallTime(),
+                "conflicts": solver.NumConflicts(),
+                "branches": solver.NumBranches(),
+            })
+
+            runs.append(((prof, seed), obj, tval, sumL, last_pack))
+
+            # aggiorna best globale
+            if (obj > best_obj) or (obj == best_obj and (tval, sumL) > (best_T, best_sumL)):
+                best_obj, best_T, best_sumL = obj, tval, sumL
+                best_pack = last_pack
+                # costruisci warm-start dalla migliore
+                warm_start = build_warm_start(solver, x)
+
+
+            
+
+            # early-stop duro se hai raggiunto il target su T
+            if target_T is not None and tval >= target_T:
+                return best_pack
+
+        # ordina i candidati di questo round per (obj, T, sumL), tieni top metà
+        runs.sort(key=lambda t: (t[1], t[2], t[3]), reverse=True)
+        keep = max(1, len(runs) // 2)
+        candidates = [t[0] for t in runs[:keep]]
+
+    # --- polishing finale con profilo "aggressive" + warm-start migliore ---
+    if best_pack is not None:
+        _, best_solver, best_x, best_r, best_L, best_z1, best_z2, best_E, best_Tvar = best_pack
+        extra_time = max(5, int(time_budget * 0.25))  # 25% extra polishing
+        cp_params = make_profile("aggressive", extra_time, seeds[0] if seeds else 0, workers)
+        status, solver, x, rvars, L, z1, z2, E, T = solve_layout(
+            coords, S, P, R, tol,
+            time_limit=extra_time,
+            alpha=0.0, Lmin=1,
+            degree_cap=degree_cap,
+            enforce_degree=enforce_degree,
+            cp_params=cp_params,
+            use_hole_penality=use_hole_penality,
+            stripe_mode=stripe_mode,
+            warm_start=build_warm_start(best_solver, best_x),
+            pre=pre,
+        )
+        obj, tval, sumL = _score_pack(status, solver, L, T)
+        if (obj > best_obj) or (obj == best_obj and (tval, sumL) > (best_T, best_sumL)):
+            return (status, solver, x, rvars, L, z1, z2, E, T)
+        else:
+            return best_pack
+
+    # se non abbiamo trovato FEASIBLE/OPTIMAL, almeno ritorna l’ultima
+    return last_pack
     
 
 
@@ -732,29 +917,46 @@ def build_acyclic_arcs(coords: np.ndarray, E, orient_axis: np.ndarray | None = N
 def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
                  time_limit: int = 60, alpha: float = 0.1, seed: int = 0, Lmin=1,
                  degree_cap=4, enforce_degree: bool = False,
-                 cp_params: dict | None = None, use_hole_penality=False, stripe_mode="auto"):
+                 w_cover=None, w_T=None, w_sum=None,
+                 w_hole1=150, w_hole_comp=600, w_end_expose=2000,
+                 cp_params: dict | None = None, use_hole_penality=False, stripe_mode="auto",
+                 warm_start: dict | None = None, pre=None):
+    
+
     N = len(coords)
     if S * P > N:
         raise SystemExit(f"Celle richieste {S*P} > disponibili {N}")
 
-    # --- grafo non diretto + assi ---
-    E, _ = build_graph(coords, R, tol)
-    e1, e2 = pca_axes(coords)
+    # --- usa precomputazioni se fornite, altrimenti calcola qui ---
+    if pre is not None:
+        E = pre["E"]
+        e1, e2 = pre["e1"], pre["e2"]
+        row_of_h = pre["row_of_h"]
+        pos_in_row_h = pre["pos_in_row_h"]
+        rows_h = pre["rows_h"]
+        row_counts_h = pre["row_counts_h"]
+        C_complete_h = pre["C_complete_h"]
+        can_hex_cols = pre["can_hex_cols"]
+        orient_axis = pre["orient_axis"]
+        A = pre["A"]
+        incoming = pre["incoming"]
+        rect_like = is_quadrangular_by_rows(row_counts_h)
+    else:
+        # calcolo "classico"
+        E, _ = build_graph(coords, R, tol)
+        e1, e2 = pca_axes(coords)
+        row_of_h, pos_in_row_h, rows_h, row_counts_h, C_complete_h = _infer_rows_and_positions_hex(coords, E)
+        rect_like = is_quadrangular_by_rows(row_counts_h)
+        can_hex_cols = (stripe_mode in ("auto","columns")) and rect_like \
+                    and (len(rows_h) >= P) and (C_complete_h >= S)
+        orient_axis = e2 if can_hex_cols else e1
+        A, incoming = build_acyclic_arcs(coords, E, orient_axis=orient_axis)
 
-    # --- euristica righe/colonne ---
-    row_of_h, pos_in_row_h, rows_h, row_counts_h, C_complete_h = _infer_rows_and_positions_hex(coords, E)
-    rect_like = is_quadrangular_by_rows(row_counts_h)
 
-    # adesso consentiamo colonne se: forma "rettangolare", R>=P, C_complete>=S
-    can_hex_cols = (stripe_mode in ("auto","columns")) and rect_like \
-                and (len(rows_h) >= P) and (C_complete_h >= S)
-
-
-    # --- colonne esagonali SOLO se: forma rettangolare, P == #righe, e ci sono almeno S colonne complete
-    
-
-    orient_axis = e2 if can_hex_cols else e1
-    A, incoming = build_acyclic_arcs(coords, E, orient_axis=orient_axis)
+    # --- default dei pesi (ora che E esiste) ---
+    if w_cover is None: w_cover = 1000 + 10 * S
+    if w_T     is None: w_T     =  100 +  2 * P
+    if w_sum   is None: w_sum   =   10 + max(1, len(E)//200)
 
     # (DEBUG) quanti nodi hanno 0 archi entranti lungo l'asse scelto?
     deg_in = np.array([len(incoming[v]) for v in range(N)], int)
@@ -764,22 +966,86 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
     neighbors = {i: [] for i in range(N)}
     for (i, j) in E:
         neighbors[i].append(j); neighbors[j].append(i)
-    interior_idx = [i for i in range(N) if len(neighbors[i]) == 6]
+
+    # (consigliato) bordo = grado < max_deg osservato
+    max_deg = max((len(neighbors[i]) for i in range(N)), default=0)
+    boundary_mask = np.array([1 if len(neighbors[i]) < max_deg else 0 for i in range(N)], dtype=int)
 
     # === model & variabili ===
     model = cp_model.CpModel()
-    rng = np.random.default_rng(seed)
 
+    # x, r
     x, r = {}, {}
     for i in range(N):
         for k in range(S):
             x[(i,k)] = model.NewBoolVar(f"x[{i},{k}]")
             r[(i,k)] = model.NewBoolVar(f"r[{i},{k}]")
 
+    # --- symmetry breaking: ordina i gruppi per proiezione della root lungo orient_axis
+    scale = 1000  # evita frazioni: s_int sono interi
+    s_int = np.round((coords @ orient_axis) * scale).astype(int)
+    pos = [model.NewIntVar(int(s_int.min()), int(s_int.max()), f"pos[{k}]") for k in range(S)]
+    for k in range(S):
+        # pos[k] = proiezione della root del gruppo k
+        model.Add(pos[k] == sum(int(s_int[i]) * r[(i,k)] for i in range(N)))
+    for k in range(S-1):
+        # strictly increasing per evitare permutazioni equivalenti
+        model.Add(pos[k] + 1 <= pos[k+1])
+
+    # --- Warm-start sugli x[(i,k)] (facoltativo) ---
+    if warm_start:
+        for (i,k), val in warm_start.items():
+            if (i,k) in x:
+                # AddHint accetta 0/1, cast a int per sicurezza
+                model.AddHint(x[(i,k)], int(val))
+
+    # --- decision strategy: visita x e r in ordine deterministico cercando 1 prima di 0
+    x_vars = [x[(i,k)] for k in range(S) for i in range(N)]
+    r_vars = [r[(i,k)] for k in range(S) for i in range(N)]
+    model.AddDecisionStrategy(x_vars, cp_model.CHOOSE_FIRST,  cp_model.SELECT_MAX_VALUE)
+    model.AddDecisionStrategy(r_vars, cp_model.CHOOSE_FIRST,  cp_model.SELECT_MAX_VALUE)
+
+    # use[i] = Σ_k x[i,k]
     use = {}
     for i in range(N):
         use[i] = model.NewIntVar(0, 1, f"use[{i}]")
         model.Add(use[i] == sum(x[(i,k)] for k in range(S)))
+
+    # --- exp[i] = cella esposta (bordo oppure ha almeno un vicino non usato) ---
+    exp, outN = {}, {}
+    for i in range(N):
+        e = model.NewBoolVar(f"exp[{i}]")
+        if boundary_mask[i] == 1:
+            model.Add(e == 1)
+        else:
+            if neighbors[i]:
+                oi = model.NewBoolVar(f"outN[{i}]")
+                for j in neighbors[i]:
+                    model.Add(oi >= 1 - use[j])                # se un vicino è vuoto → oi può essere 1
+                model.Add(oi <= sum(1 - use[j] for j in neighbors[i]))  # upper bound
+                model.Add(e == oi)
+                outN[i] = oi
+            else:
+                model.Add(e == 1)  # cella isolata: esposta
+        exp[i] = e
+
+    # --- esposizione gruppi agli estremi della catena (k=0 e k=S-1) ---
+    end_groups = [0] if S == 1 else [0, S-1]
+    g_exposed = {}
+    for k_end in end_groups:
+        eik = []
+        for i in range(N):
+            ei = model.NewBoolVar(f"exp_in_grp[{k_end},{i}]")
+            model.Add(ei <= x[(i, k_end)])
+            model.Add(ei <= exp[i])
+            model.Add(ei >= x[(i, k_end)] + exp[i] - 1)  # AND
+            eik.append(ei)
+        gk = model.NewBoolVar(f"group_exposed[{k_end}]")
+        if eik:
+            model.AddMaxEquality(gk, eik)  # OR sugli ei
+        else:
+            model.Add(gk == 0)
+        g_exposed[k_end] = gk
 
     # (1) gruppi da P celle, (2) ogni cella al più una volta, (3) una root per gruppo
     for k in range(S):
@@ -832,33 +1098,35 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
     for k in range(S):
         model.Add(sum(y[(i, j, k)] for (i, j) in A) == sum(x[(i, k)] for i in range(N)) - 1)
 
-     # --- Rilevazione "buco": cella non assegnata con TUTTI i vicini assegnati ---
-    holes = []   # lista di h[i] da penalizzare
-    if use_hole_penality:
-        for i in interior_idx:
-            # g[i] = AND_{j in N(i)} use[j]
-            gi = model.NewBoolVar(f"allN_used[{i}]")
-            # g <= use[j] per tutti i vicini
-            for j in neighbors[i]:
-                model.Add(gi <= use[j])
-            # g >= sum(use[j]) - (m-1), con m = grado(i)
-            m = len(neighbors[i])  # qui m=6
-            model.Add(gi >= sum(use[j] for j in neighbors[i]) - (m - 1))
 
-            # h[i] = (1 - use[i]) AND gi
-            hi = model.NewBoolVar(f"hole[{i}]")
-            model.Add(hi <= 1 - use[i])
-            model.Add(hi <= gi)
-            # h >= gi + (1 - use[i]) - 1  →  h >= gi - use[i]
-            model.Add(hi >= gi - use[i])
-            holes.append(hi)
+    # --- Single-cell holes (opzionale): definisci sempre holes per evitare NameError ---
+    holes = []   # sarà una lista di BoolVar; se non usata resta vuota
 
+
+
+
+    # ------ NUOVO: buco multi-cella (componenti interne dei NON-assegnati) ------
+    HOLE_MODE = "penalize"   # "forbid" per vietarli del tutto
+    hole_vars = add_unused_component_forest(
+        model,
+        N=N,
+        A_dir=A,             # DAG che hai già costruito con build_acyclic_arcs
+        incoming=incoming,
+        use=use,
+        boundary_mask=boundary_mask,
+        mode=HOLE_MODE
+    )
+
+            
+    # bound stretto per Lk
+    Delta = max((len(neighbors[i]) for i in range(N)), default=0)
+    L_cap = min(2 * P * Delta, 2 * len(E))
 
     # --- (5) Link tra gruppi consecutivi (z1/z2) su TUTTI gli archi E ---
     L = []
     z1, z2 = {}, {}
     for k in range(S-1):
-        Lk = model.NewIntVar(0, max(1, 2*len(E)), f"L[{k}]")
+        Lk = model.NewIntVar(0, L_cap, f"L[{k}]")
         link_terms = []
         for (i, j) in E:
             z1[(k,i,j)] = model.NewBoolVar(f"z1[{k},{i}-{j}]")  # i in k, j in k+1
@@ -887,25 +1155,38 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
 
 
 
-   # --- Obiettivo: copertura, minimo T, somma contatti, penalità buchi ---
+    # --- Obiettivo: copertura, minimo T, somma contatti, penalità ---
     T = None
     if L:
+        # b[k] = 1 se Lk >= 1
         b = []
         for k, Lk in enumerate(L):
             bk = model.NewBoolVar(f"connected[{k}]")
             model.Add(Lk >= bk)
             b.append(bk)
 
-        T = model.NewIntVar(0, 2*P, "T_min_links")
+        # T = min_k Lk
+        T = model.NewIntVar(0, 2 * P, "T_min_links")
         for Lk in L:
             model.Add(T <= Lk)
 
-        wCover, wT, wSum = 10_000, 1_000, 100
-        wHole = 300   # <<< peso penalità buchi (puoi tararlo)
-        if holes:
-            model.Maximize(wCover * sum(b) + wT * T + wSum * sum(L) - wHole * sum(holes))
-        else:
-            model.Maximize(wCover * sum(b) + wT * T + wSum * sum(L))
+        # base: copertura, T minimo, somma link
+        obj = w_cover * sum(b) + w_T * T + w_sum * sum(L)
+
+        # penalità estremi non esposti
+        for k_end in end_groups:
+            obj -= w_end_expose * (1 - g_exposed[k_end])
+
+        # penalità componenti interne dei NON-assegnati (multi-cella)
+        hole_comp_term = hole_vars.get("n_holes") if 'hole_vars' in locals() else None
+        if hole_comp_term is not None:
+            obj -= w_hole_comp * hole_comp_term
+
+        # penalità micro-buchi singoli (se attivata)
+        if use_hole_penality and holes:
+            obj -= w_hole1 * sum(holes)
+
+        model.Maximize(obj)
     else:
         model.Maximize(0)
 
@@ -972,6 +1253,8 @@ def plot_solution(coords, R, S, x, z1, z2, E, L, solver,
                     xi, yi = coords[i]
                     xj, yj = coords[j]
                     ax.plot([xi, xj], [yi, yj], linewidth=1.0, alpha=0.5, color="black", zorder=3)
+
+    
 
     # frecce con ordine (k -> k+1) e label con #link
     if show_arrows:

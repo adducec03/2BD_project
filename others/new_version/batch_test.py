@@ -6,7 +6,7 @@ import matplotlib
 matplotlib.use("Agg")  # niente finestre
 import matplotlib.pyplot as plt
 
-import battery_layout_cpsat_v2 as bc
+import others.new_version.battery_layout_cpsat_v2 as bc
 from ortools.sat.python import cp_model
 
 

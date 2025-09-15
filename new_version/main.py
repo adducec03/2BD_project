@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse
 
 import circle_packing as cp
 import findBestConfiguration as fc
-import battery_layout_cpsat_v2 as bl
+import battery_layout_cpsat as bl
 from ortools.sat.python import cp_model
 from build_battery_trimesh import convert_2d_to_3d
 from contact import attach_2d_contacts
@@ -497,12 +497,12 @@ def elabora_dati(input_file_path: str):
             continue
 
         # Parametri solver (tieni i tuoi default preferiti)
-        time_budget = 10
+        time_budget = 30
         tol = 2.0
         degree_cap = 6
         enforce_degree = False
         target_T = 2 * P
-        use_hole_penality = False
+        use_hole_penality = True
 
         status, solver, x, r, L, z1, z2, E, T = bl.auto_tune_and_solve(
             coords, S, P, R, tol,

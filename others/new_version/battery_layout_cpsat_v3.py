@@ -54,313 +54,429 @@ import numpy.linalg as npl
 
 
 import numpy.linalg as npl
+from ortools.sat.python import cp_model
 
-def build_vertical_slot_snake_allowed_sets(coords, E, S, P,
-                                           start_corner="BL",
-                                           slot_slack=0,
-                                           strict=True):
+
+
+def add_unused_component_forest(
+    model,
+    N,
+    A_dir,           # archi diretti aciclici (da build_acyclic_arcs)
+    incoming,        # incoming[v] = lista archi (u->v)
+    use,             # dict: use[i] ∈ {0,1} già nel tuo modello
+    boundary_mask,   # np.array di 0/1: 1 = cella di bordo
+    mode="penalize", # "penalize" | "forbid"
+):
     """
-    Serpentina per *colonne di slot*:
-      - per ogni riga r ordino le celle left→right e le divido in slot da P
-      - percorro la colonna di slot s=0 salendo (o scendendo) tutte le righe,
-        poi 'curvo' e percorro s=1 nella direzione opposta, ecc.
+    Costruisce una foresta sulle celle NON assegnate U[i] = 1 - use[i].
+    - Se mode="forbid": vieta componenti interne (nessuna radice ammessa dentro).
+    - Se mode="penalize": consente radici interne ma le segnala per la penalità.
+
     Ritorna:
-      allowed[k]  = insiemi di celle candidabili per il gruppo k
-      row_of_grp  = riga del gruppo k (info di debug)
-      order_list  = lista piatta di indici nell’ordine della serpentina (per preview)
-      row_idx     = indice riga per ogni cella
+      vars: dict con chiavi:
+        "U":  dict[i] -> IntVar {0,1}
+        "yH": dict[(u,v)] -> BoolVar, archi della foresta sui non-assegnati
+        "rH": dict[i] -> BoolVar, radici di componente sui non-assegnati
+        "n_holes": IntVar (solo in mode="penalize"), #componenti interne
     """
-    import numpy as np
-    # assi principali
-    e1, e2 = pca_axes(coords)
-    pitch = estimate_row_pitch_from_edges(coords, E, e1, e2)
+    # U[i] = 1 - use[i]
+    U = {i: model.NewIntVar(0, 1, f"U[{i}]") for i in range(N)}
+    for i in range(N):
+        model.Add(U[i] == 1 - use[i])
 
-    t_row = coords @ e2
-    t_col = coords @ e1
-    r0 = t_row.min()
-    row_idx = np.round((t_row - r0) / pitch).astype(int)
+    # Archi sulla foresta dei non-assegnati
+    yH = {}
+    for (u, v) in A_dir:
+        y = model.NewBoolVar(f"yH[{u}->{v}]")
+        # attivo solo se entrambi i nodi sono non-assegnati
+        model.Add(y <= U[u])
+        model.Add(y <= U[v])
+        yH[(u, v)] = y
 
-    # celle per riga ordinate left→right
-    from collections import defaultdict
-    by_row = defaultdict(list)
-    for i, r in enumerate(row_idx):
-        by_row[int(r)].append(i)
-    for r in by_row:
-        by_row[r].sort(key=lambda i: t_col[i])
+    # Radici (una per componente): preferibilmente sul bordo
+    rH = {i: model.NewBoolVar(f"rH[{i}]") for i in range(N)}
+    for i in range(N):
+        model.Add(rH[i] <= U[i])  # puoi essere root solo se non-assegnato
+        if mode == "forbid":
+            # vieta radici interne: obbliga ogni componente a toccare il bordo
+            if int(boundary_mask[i]) == 0:
+                model.Add(rH[i] == 0)
 
-    rows = sorted(by_row.keys())
-    # ordine verticale: BL/BR = bottom→top, TL/TR = top→bottom
-    rows_sorted = rows if start_corner in ("BL", "BR") else rows[::-1]
+    # Bilancio per ogni nodo: somma incoming + root = U[i]
+    for i in range(N):
+        model.Add(sum(yH[(u, i)] for (u, _v) in incoming[i]) + rH[i] == U[i])
 
-    # suddivido ogni riga in slot contigui da P
-    slots = {}            # r -> [ [idx slot0], [idx slot1], ... ]
-    nslots_max = 0
-    for r in rows:
-        lst = by_row[r]
-        ns = len(lst) // P
-        slots[r] = [lst[s*P:(s+1)*P] for s in range(ns)]
-        nslots_max = max(nslots_max, ns)
+    # In una foresta: #archi = #nodi - #radici
+    model.Add(sum(yH.values()) == sum(U[i] for i in range(N)) - sum(rH[i] for i in range(N)))
 
-    # capacità disponibile in slot interi
-    cap_groups = sum(len(slots[r]) for r in rows)
-    if strict and cap_groups < S:
-        raise SystemExit(f"Capienza in slot={cap_groups} < S={S} (P={P})")
+    out = {"U": U, "yH": yH, "rH": rH}
 
-    allowed, row_of_grp, order_list = [], [], []
+    if mode == "penalize":
+        # Conta quante radici sono in celle INTERNE (cioè componenti senza bordo)
+        int_roots = []
+        for i in range(N):
+            if int(boundary_mask[i]) == 0:
+                si = model.NewBoolVar(f"intRoot[{i}]")
+                model.Add(si == rH[i])      # s[i] = rH[i] se non di bordo
+                int_roots.append(si)
+        n_holes = model.NewIntVar(0, N, "n_hole_components")
+        if int_roots:
+            model.Add(n_holes == sum(int_roots))
+        else:
+            model.Add(n_holes == 0)
+        out["n_holes"] = n_holes
 
-    # scelgo direzione della prima colonna: se parto dal basso, salgo
-    up_first = start_corner in ("BL", "BR")
-    go_up = up_first
-
-    # per colonna di slot
-    for s in range(nslots_max):
-        # righe che hanno lo slot s
-        avail_rows = [r for r in rows_sorted if s < len(slots[r])]
-        if not go_up:
-            avail_rows = avail_rows[::-1]  # “curva” → direzione opposta
-
-        for r in avail_rows:
-            base = slots[r][s]
-            # finestra di tolleranza dentro la stessa riga
-            a = max(0, s*P - slot_slack)
-            b = min(len(by_row[r]), (s+1)*P + slot_slack)
-            cand = set(by_row[r][a:b])
-
-            allowed.append(cand)
-            row_of_grp.append(r)
-            order_list.extend(base)   # per preview: uso l’ordine ‘puro’ dello slot
-
-            if len(allowed) == S:
-                break
-        if len(allowed) == S:
-            break
-        go_up = not go_up   # alterno salita/discesa
-
-    # se strict=False e ho ancora gruppi, allargo a “tutto il resto”
-    if len(allowed) < S and not strict:
-        rest = set(i for r in rows for i in by_row[r])
-        while len(allowed) < S:
-            allowed.append(rest)
-            row_of_grp.append(None)
-
-    return allowed, row_of_grp, order_list, row_idx
-
-def build_vertical_slot_snake_order(coords, E, P,
-                                    start_corner="BL",   # BL = in basso a sinistra
-                                    move="left"):        # "left" = colonne verso sinistra (come chiedi tu)
-    e1, e2 = pca_axes(coords)
-    pitch = estimate_row_pitch_from_edges(coords, E, e1, e2)
-    t_row = coords @ e2
-    t_col = coords @ e1
-    r0 = t_row.min()
-    row_idx = np.round((t_row - r0) / pitch).astype(int)
-
-    from collections import defaultdict
-    by_row = defaultdict(list)
-    for i, r in enumerate(row_idx):
-        by_row[int(r)].append(i)
-    # ordino le celle in riga da sinistra a destra (asse e1)
-    for r in by_row:
-        by_row[r].sort(key=lambda i: t_col[i])
-
-    rows = sorted(by_row.keys()) if start_corner in ("BL","BR") else list(reversed(sorted(by_row.keys())))
-    # slot da P celle per riga
-    slots_by_row = {r: [by_row[r][s*P:(s+1)*P] for s in range(len(by_row[r]) // P)] for r in rows}
-    max_slots = max((len(slots_by_row[r]) for r in rows), default=0)
-
-    # ordine delle colonne (slot index s)
-    slot_order = list(reversed(range(max_slots))) if move == "left" else list(range(max_slots))
-
-    # serpentina verticale: colonna s0 dal basso all'alto, s1 dall'alto al basso, s2 dal basso all'alto, ...
-    order = []
-    for c, s in enumerate(slot_order):
-        vertical = rows if (c % 2 == 0) else list(reversed(rows))
-        for r in vertical:
-            if s < len(slots_by_row.get(r, [])):
-                order.extend(slots_by_row[r][s])
-    return order, row_idx
+    return out
 
 
-
-def plan_snake_rows(coords, E, S, P, start_corner="TL"):
+def add_row_block_stripes(model, x, S, P,
+                          row_of, pos_in_row, rows, row_counts):
     """
-    Calcola un piano 'direzionale' per la serpentina a righe:
-      - row_idx[i]  : indice di riga per ogni cella i
-      - target_row  : riga target per ciascun gruppo (riempimento riga-per-riga)
-      - go_L2R[r]   : direzione di percorrenza della riga r (True: L→R, False: R→L)
-      - s_scaled[i] : proiezione intera lungo l'asse 'orizzontale' e1 (serve per ordinare)
-      - bigM        : costante large-M per eventuali vincoli su smin/smax
-
-    Nota: qui target_row è solo informativo per preview/diagnostica; il tuo solve_layout
-    attuale usa gli slot di riga (build_row_slot_snake_allowed_sets).
+    Se un gruppo k usa la riga r, deve prendere esattamente P celle
+    contigue (un blocco) in quella riga.
+    - y[r,k] = 1 se la riga r è assegnata al gruppo k (al più una riga per gruppo, al più un gruppo per riga)
+    - b[r,k,c0] = 1 se il blocco di lunghezza P inizia alla posizione c0 (0..Lr-P)
+    - x[(i,k)] può essere 1 solo se la sua posizione c è coperta dal blocco scelto
     """
-    # assi principali
-    e1, e2 = pca_axes(coords)                               # e1 = orizzontale lungo le righe, e2 = verticale (tra righe)
-    pitch = estimate_row_pitch_from_edges(coords, E, e1, e2)
+    N = len(row_of)
+    R = len(rows)
 
-    t_perp = coords @ e2                                    # coordinata "di riga"
-    t_par  = coords @ e1                                    # coordinata "di colonna"
+    # y[r,k] = riga r assegnata al gruppo k
+    y = {(r,k): model.NewBoolVar(f"row_assign[{r},{k}]") for r in range(R) for k in range(S)}
 
-    # indice di riga intero
-    r0 = t_perp.min()
-    row_idx = np.round((t_perp - r0) / pitch).astype(int)
+    # 1) ogni gruppo sceglie esattamente una riga
+    for k in range(S):
+        model.Add(sum(y[(r,k)] for r in range(R)) == 1)
 
-    # celle per riga ordinate lungo e1
-    from collections import defaultdict
-    by_row = defaultdict(list)
-    for i, r in enumerate(row_idx):
-        by_row[int(r)].append(i)
-    for r in by_row:
-        by_row[r].sort(key=lambda i: t_par[i])
+    # 2) ogni riga al più un gruppo (se vuoi imporre copertura perfetta quando S==R, cambia in ==1)
+    for r in range(R):
+        model.Add(sum(y[(r,k)] for k in range(S)) <= 1)
 
-    rows = sorted(by_row.keys())
+    # 3) Prepara mapping riga→lista (ordinata) di (pos, cell_index)
+    by_row = {r: [] for r in range(R)}
+    for i in range(N):
+        rr = int(row_of[i])
+        if rr in by_row:
+            by_row[rr].append((int(pos_in_row[i]), i))
+    for r in range(R):
+        by_row[r].sort(key=lambda t: t[0])  # ordina per posizione crescente
 
-    # ordine verticale delle righe in base all'angolo di partenza
-    # TL/TR = parto dall'alto → verso il basso; BL/BR = dal basso → verso l'alto
-    rows_sorted = rows[::-1] if start_corner in ("TL", "TR") else rows[:]
+    # 4) Contiguità: blocco di P posizioni consecutive
+    b = {}  # b[(r,k,c0)]
+    for r in range(R):
+        Lr = row_counts[r]
+        max_start = max(0, Lr - P)
+        for k in range(S):
+            # somma(x_i_k su riga r) = P * y[r,k]
+            idxs_r = [i for (_c, i) in by_row[r]]
+            model.Add(sum(x[(i,k)] for i in idxs_r) == P * y[(r,k)])
 
-    # direzione serpentina per ciascuna riga
-    left_to_right_first = start_corner in ("TL", "BL")
-    go_L2R = {}
-    row_to_step = {r: i for i, r in enumerate(rows_sorted)}
-    for r in rows:
-        step = row_to_step.get(r, 0)
-        go = (step % 2 == 0)
-        if not left_to_right_first:
-            go = not go
-        go_L2R[r] = go  # True = L→R, False = R→L
+            # variabili "start" del blocco
+            starts = []
+            for c0 in range(max_start + 1):
+                b[(r,k,c0)] = model.NewBoolVar(f"blkstart[{r},{k},{c0}]")
+                starts.append(b[(r,k,c0)])
+            # scegli esattamente 1 start se la riga è usata, 0 altrimenti
+            if starts:
+                model.Add(sum(starts) == y[(r,k)])
+            else:
+                # riga troppo corta per P → forza y[r,k]=0
+                model.Add(y[(r,k)] == 0)
 
-    # asse orizzontale scalato a interi (comodo per ordinare/dare vincoli)
-    s = t_par
-    smin, smax = float(s.min()), float(s.max())
-    scale = 1000.0 / (smax - smin + 1e-9)
-    s_scaled = np.round((s - smin) * scale).astype(int)
-    bigM = int(s_scaled.max() - s_scaled.min() + 10)
+            # x(i,k) consentito solo se la sua posizione c cade nel blocco scelto
+            # x[i,k] ≤ Σ_{c0: c0 ≤ c ≤ c0+P-1} b[r,k,c0]
+            for (c, i) in by_row[r]:
+                cover_starts = []
+                for c0 in range(max_start + 1):
+                    if c0 <= c <= c0 + P - 1:
+                        cover_starts.append(b[(r,k,c0)])
+                if cover_starts:
+                    model.Add(x[(i,k)] <= sum(cover_starts))
+                else:
+                    # se nessun blocco può coprire c, allora x[i,k] deve essere 0
+                    model.Add(x[(i,k)] == 0)
 
-    # riga target per i gruppi: prova a “riempire” le righe in ordine serpentina
-    # (numero di gruppi per riga = len(riga)//P). Se non bastano, ripeti le righe
-    # più capienti giusto per avere una lista di lunghezza S.
-    cap_groups_per_row = {r: len(by_row[r]) // P for r in rows}
-    target_row = []
-    for r in rows_sorted:
-        use = min(cap_groups_per_row[r], S - len(target_row))
-        target_row += [r] * use
-        if len(target_row) == S:
-            break
-    if len(target_row) < S:
-        # completa scegliendo righe con più spazio residuo
-        rows_by_room = sorted(rows, key=lambda rr: (-cap_groups_per_row[rr], rr))
-        for i in range(S - len(target_row)):
-            target_row.append(rows_by_room[i % len(rows_by_room)])
-
-    return row_idx, target_row, go_L2R, s_scaled, bigM
-
-def build_order_from_plan(coords, row_idx, go_L2R, s_scaled, start_corner="TL"):
+def is_quadrangular_by_rows(row_counts: np.ndarray) -> bool:
     """
-    Crea un 'order' coerente con il piano a serpentina ottenuto con plan_snake_rows:
-    - dentro ogni riga ordina per s_scaled (proiezione lungo e1)
-    - inverte la riga se go_L2R[r] è False
-    - concatena le righe nell'ordine imposto dallo start_corner
+    True se:
+      - il numero di celle per riga varia al più di 1 (max-min <= 1)
+      - righe adiacenti differiscono al più di 1
     """
-    import numpy as np
-    rows = sorted(set(int(r) for r in row_idx))
-    # stesso ordinamento verticale usato nel plan: TL/TR = dall'alto verso il basso
-    rows_sorted = rows[::-1] if start_corner in ("TL", "TR") else rows[:]
+    rc = np.asarray(row_counts, dtype=int)
+    if rc.size < 2:
+        return False
+    if (rc.max() - rc.min()) > 1:
+        return False
+    diffs = np.abs(np.diff(rc))
+    return int(diffs.max(initial=0)) <= 1
 
-    by_row = {r: [] for r in rows_sorted}
-    for i, r in enumerate(row_idx):
-        by_row[int(r)].append(i)
-
-    order = []
-    for r in rows_sorted:
-        idx = by_row[r]
-        idx.sort(key=lambda i: int(s_scaled[i]))     # sinistra→destra lungo e1
-        if not go_L2R[r]:                            # inverti se la riga va R→L
-            idx.reverse()
-        order.extend(idx)
-    return order
-
-
-def build_row_slot_snake_allowed_sets(coords, E, S, P,
-                                      start_corner="TL",
-                                      row_window_slack=1,
-                                      strict_rows=True):
+def _infer_rows_and_positions_hex(coords, E):
     """
-    Divide ogni riga in slot contigui da P celle e costruisce l'ordine
-    dei gruppi alternando gli slot di due righe adiacenti (serpentina).
+    Rileva le righe di una griglia esagonale e, per ogni riga,
+    l'ordine orizzontale delle celle (posizione/rango nella riga).
+
     Ritorna:
-      - allowed: lista di insiemi consentiti per ciascun gruppo k
-      - row_of_group: riga assegnata al gruppo k (int)
-      - row_idx: indice di riga per ogni cella
+      row_of[i]      : indice riga della cella i   (0..R-1)
+      pos_in_row[i]  : posizione nella riga (0..len(riga)-1)
+      rows           : lista degli indici riga presenti (0..R-1)
+      row_counts     : np.array con #celle per riga
+      C_complete     : numero di 'colonne complete' (min(row_counts))
     """
+    e1, e2 = pca_axes(coords)  # e1: orizzontale (asse lungo), e2: verticale
+    pitch_r = estimate_row_pitch_from_edges(coords, E, e1, e2)
+
+    t_row = coords @ e2       # coordinata "verticale" → per raggruppare righe
+    t_col = coords @ e1       # coordinata "orizzontale" → per ordinare nella riga
+
+    r0 = t_row.min()
+    row_of = np.round((t_row - r0) / max(1e-9, pitch_r)).astype(int)
+
+    # raggruppa per riga e ordina orizzontalmente
+    from collections import defaultdict
+    by_row = defaultdict(list)
+    for i, r in enumerate(row_of):
+        by_row[int(r)].append(i)
+    rows = sorted(by_row.keys())
+
+    pos_in_row = np.empty(len(coords), dtype=int)
+    for r in rows:
+        # ordina da sinistra a destra lungo e1
+        by_row[r].sort(key=lambda i: t_col[i])
+        for p, i in enumerate(by_row[r]):
+            pos_in_row[i] = p
+
+    row_counts = np.array([len(by_row[r]) for r in rows], dtype=int)
+    C_complete = int(row_counts.min()) if len(row_counts) else 0
+    return row_of, pos_in_row, rows, row_counts, C_complete
+
+def add_hex_column_block_stripes(model, x, S, P,
+                                 row_of, pos_in_row, rows, C_complete,
+                                 force_consecutive_cols=False):
+    """
+    Colonne per griglia esagonale con blocco verticale contiguo:
+      – gruppo k sceglie una colonna c (tra 0..C_complete-1)
+      – sceglie uno start r0 (0..R-P)
+      – prende esattamente 1 cella per ciascuna riga r ∈ [r0, r0+P-1] in quella colonna.
+    Precondizioni: C_complete >= S, len(rows) (=R) >= P
+
+    Se force_consecutive_cols=True impone col[k] = col0 + k (gruppi su colonne adiacenti).
+    """
+    N = len(row_of)
+    R = len(rows)
+    assert C_complete >= S and R >= P
+
+    # Mappa (r,c) -> lista di celle (di solito 1)
+    I_rc = {(r, c): [] for r in range(R) for c in range(C_complete)}
+    for i in range(N):
+        r = int(row_of[i]); c = int(pos_in_row[i])
+        if 0 <= r < R and 0 <= c < C_complete:
+            I_rc[(r, c)].append(i)
+
+    # y[c,k] = colonna scelta dal gruppo k
+    y = {(c,k): model.NewBoolVar(f"hexcol[{c},{k}]")
+         for c in range(C_complete) for k in range(S)}
+    for k in range(S):
+        model.Add(sum(y[(c,k)] for c in range(C_complete)) == 1)
+    for c in range(C_complete):
+        model.Add(sum(y[(c,k)] for k in range(S)) <= 1)
+
+    # opzionale: colonne consecutive e in ordine
+    if force_consecutive_cols:
+        col0 = model.NewIntVar(0, C_complete - S, "col0")
+        for k in range(S):
+            ck = model.NewIntVar(0, C_complete - 1, f"col[{k}]")
+            model.Add(ck == col0 + k)
+            model.Add(ck == sum(c * y[(c,k)] for c in range(C_complete)))
+
+    # b[c,k,r0] = blocco verticale che parte da r0 per il gruppo k nella colonna c
+    b = {}
+    for c in range(C_complete):
+        for k in range(S):
+            max_start = R - P
+            starts = []
+            for r0 in range(max_start + 1):
+                b[(c,k,r0)] = model.NewBoolVar(f"vblk[{c},{k},{r0}]")
+                starts.append(b[(c,k,r0)])
+            # scegli esattamente 1 start se la colonna è usata
+            if starts:
+                model.Add(sum(starts) == y[(c,k)])
+            else:
+                # se R < P non si entra qui perché abbiamo assert R >= P
+                pass
+
+            # vincoli cell-by-cell: per ogni riga r, se è dentro il blocco, prendi 1 cella in (r,c)
+            for r in range(R):
+                idxs = I_rc[(r, c)]
+                # copertura verticale: r è "attivo" se r ∈ [r0, r0+P-1] per lo start scelto
+                cover = []
+                for r0 in range(max_start + 1):
+                    if r0 <= r <= r0 + P - 1:
+                        cover.append(b[(c,k,r0)])
+                if idxs and cover:
+                    # somma x sulla riga r e colonna c = y[c,k] * is_row_used
+                    model.Add(sum(x[(i,k)] for i in idxs) == sum(cover))
+                else:
+                    # nessuna cella in (r,c) oppure r non può cadere in alcun blocco → deve essere 0
+                    if idxs:
+                        model.Add(sum(x[(i,k)] for i in idxs) == 0)
+
+    # Nota: il vincolo Σ_i x[(i,k)] == P (già nel modello) è compatibile:
+    # per ciascun gruppo k, esattamente P righe risultano "coperte" (una cella per riga) → totale P.
+
+
+def estimate_col_pitch_from_edges(coords, E, e1, e2):
+    """Passo tra colonne usando le differenze di proiezione su e1."""
+    t = coords @ e1
+    dt = np.abs(t[[i for i,_ in E]] - t[[j for _,j in E]])
+    if len(dt) == 0:
+        return max(1.0, 2.0 * 0.5 * 2)  # fallback rozzo
+    thr = np.quantile(dt, 0.60)
+    cand = dt[dt >= thr]
+    if len(cand) == 0:
+        cand = dt
+    pitch = float(np.median(cand))
+    if pitch < 1e-6:
+        pitch = float(np.median(dt)) if np.median(dt) > 0 else 1.0
+    return pitch
+
+def infer_row_col_indices(coords, E):
+    """Ritorna (row_of, col_of, n_rows, n_cols, row_counts, col_counts)."""
     e1, e2 = pca_axes(coords)
-    pitch = estimate_row_pitch_from_edges(coords, E, e1, e2)
+    pitch_r = estimate_row_pitch_from_edges(coords, E, e1, e2)
+    pitch_c = estimate_col_pitch_from_edges(coords, E, e1, e2)
     t_row = coords @ e2
     t_col = coords @ e1
     r0 = t_row.min()
-    row_idx = np.round((t_row - r0) / pitch).astype(int)
+    c0 = t_col.min()
+    row_of = np.round((t_row - r0) / pitch_r).astype(int)
+    col_of = np.round((t_col - c0) / pitch_c).astype(int)
+    # normalizza indici a 0..R-1 e 0..C-1
+    r_map = {r:i for i, r in enumerate(sorted(np.unique(row_of)))}
+    c_map = {c:i for i, c in enumerate(sorted(np.unique(col_of)))}
+    row_of = np.array([r_map[r] for r in row_of], int)
+    col_of = np.array([c_map[c] for c in col_of], int)
+    n_rows = len(r_map)
+    n_cols = len(c_map)
+    row_counts = np.bincount(row_of, minlength=n_rows)
+    col_counts = np.bincount(col_of, minlength=n_cols)
+    return row_of, col_of, n_rows, n_cols, row_counts, col_counts
 
-    from collections import defaultdict
-    by_row = defaultdict(list)
-    for i, r in enumerate(row_idx):
-        by_row[int(r)].append(i)
-    for r in by_row:
-        by_row[r].sort(key=lambda i: t_col[i])
 
-    rows = sorted(by_row.keys(), reverse=(start_corner in ("TL","TR")))
-    left_to_right_first = start_corner in ("BL","TL")
+def add_stripe_constraints(model, x, S, P,
+                           row_of, col_of,
+                           mode,               # "columns" oppure "rows"
+                           n_rows, n_cols,
+                           must_cover_all_stripes=False):
+    """
+    Impone che ogni gruppo k usi ESATTAMENTE P celle da UNA sola colonna (mode="columns")
+    oppure da UNA sola riga (mode="rows").
+    Se S < n_cols (o n_rows), il solver sceglie quali colonne (o righe) usare.
+    """
+    N = len(col_of) if mode == "columns" else len(row_of)
 
-    # capienza massima in slot interi
-    cap_groups = sum(len(by_row[r]) // P for r in rows)
-    if strict_rows and cap_groups < S:
-        raise SystemExit(
-            f"Capienza slot su singole righe = {cap_groups} < S={S} "
-            f"(P={P}). Riduci S/P o usa strict_rows=False."
+    if mode == "columns":
+        # y[c,k] = 1 se la colonna c è assegnata al gruppo k
+        y = {(c,k): model.NewBoolVar(f"col_assign[{c},{k}]") for c in range(n_cols) for k in range(S)}
+        # a ogni gruppo esattamente una colonna
+        for k in range(S):
+            model.Add(sum(y[(c,k)] for c in range(n_cols)) == 1)
+        # ogni colonna al più un gruppo (==1 se vuoi coprire tutte le colonne quando S==n_cols)
+        for c in range(n_cols):
+            if must_cover_all_stripes and S == n_cols:
+                model.Add(sum(y[(c,k)] for k in range(S)) == 1)
+            else:
+                model.Add(sum(y[(c,k)] for k in range(S)) <= 1)
+        # celle vincolate: le celle della colonna c possono andare solo al gruppo k collegato a c
+        idx_by_col = {c: [i for i in range(N) if col_of[i] == c] for c in range(n_cols)}
+        for c in range(n_cols):
+            for k in range(S):
+                # somma celle della colonna c nel gruppo k = P * y[c,k]
+                model.Add(sum(x[(i,k)] for i in idx_by_col[c]) == P * y[(c,k)])
+        # tutte le altre x[(i,k)] fuori dalla colonna assegnata sono implicitamente 0 grazie ai vincoli sopra
+
+    elif mode == "rows":
+        # y[r,k] = 1 se la riga r è assegnata al gruppo k
+        y = {(r,k): model.NewBoolVar(f"row_assign[{r},{k}]") for r in range(n_rows) for k in range(S)}
+        for k in range(S):
+            model.Add(sum(y[(r,k)] for r in range(n_rows)) == 1)
+        for r in range(n_rows):
+            if must_cover_all_stripes and S == n_rows:
+                model.Add(sum(y[(r,k)] for k in range(S)) == 1)
+            else:
+                model.Add(sum(y[(r,k)] for k in range(S)) <= 1)
+        idx_by_row = {r: [i for i in range(N) if row_of[i] == r] for r in range(n_rows)}
+        for r in range(n_rows):
+            for k in range(S):
+                model.Add(sum(x[(i,k)] for i in idx_by_row[r]) == P * y[(r,k)])
+    else:
+        raise ValueError("mode deve essere 'columns' o 'rows'")
+
+
+def make_profile(profile_name: str, time_s: float, seed: int, workers: int):
+    p = dict(
+        max_time_in_seconds=float(time_s),
+        num_search_workers=int(workers),
+        random_seed=int(seed),
+        randomize_search=True,
+        search_branching=cp_model.PORTFOLIO_SEARCH,
+        log_search_progress=True,
+    )
+    if profile_name == "fast":
+        p.update(dict(cp_model_presolve=True, cp_model_probing_level=0, linearization_level=0))
+    elif profile_name == "quality":
+        p.update(dict(cp_model_presolve=True, cp_model_probing_level=1, linearization_level=1))
+    elif profile_name == "aggressive":
+        p.update(dict(cp_model_presolve=True, cp_model_probing_level=2, linearization_level=2))
+    return p
+
+def auto_tune_and_solve(coords, S, P, R, tol,
+                        time_budget=60,
+                        target_T=None,     # metti <= 2*P, altrimenti None
+                        degree_cap=6,
+                        enforce_degree=False,
+                        profiles=("fast","fast","quality"),
+                        seeds=(0,1,2,3),
+                        workers=6,
+                        use_hole_penality=False, stripe_mode="auto"):
+    combos = []
+    for t in range(max(len(profiles), len(seeds))):
+        combos.append( (profiles[t % len(profiles)], seeds[t % len(seeds)]) )
+
+    per_run = max(5, time_budget // max(1, len(combos)))
+    best_pack, best_T, best_sumL = None, -1, -1
+
+    # cap target_T a 2*P (limite realistico)
+    if target_T is not None:
+        target_T = min(target_T, 2*P)
+
+    for (prof, seed) in combos:
+        cp_params = make_profile(prof, per_run, seed, workers)
+
+        status, solver, x, r, L, z1, z2, E, T = solve_layout(
+            coords, S, P, R, tol,
+            time_limit=per_run, alpha=0.0, Lmin=1,
+            degree_cap=degree_cap, enforce_degree=enforce_degree,
+            cp_params=cp_params, use_hole_penality=False,
+            stripe_mode=stripe_mode
         )
 
-    allowed, row_of_group = [], []
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            tval = solver.Value(T) if T is not None else 0
+            sumL = sum(int(solver.Value(Lk)) for Lk in L)
+            if (tval > best_T) or (tval == best_T and sumL > best_sumL):
+                best_pack = (status, solver, x, r, L, z1, z2, E, T)
+                best_T, best_sumL = tval, sumL
+            if target_T is not None and tval >= target_T:
+                break
 
-    for p in range(0, len(rows), 2):
-        rA = rows[p]
-        rB = rows[p+1] if p+1 < len(rows) else None
-        A = by_row[rA][:]
-        B = by_row[rB][:] if rB is not None else []
-
-        go_A_l2r = (p // 2) % 2 == 0
-        if not left_to_right_first:
-            go_A_l2r = not go_A_l2r
-        go_B_l2r = not go_A_l2r
-
-        if not go_A_l2r: A = list(reversed(A))
-        if rB is not None and not go_B_l2r: B = list(reversed(B))
-
-        nA = len(A) // P
-        nB = len(B) // P
-
-        # interleave degli slot: A0, B0, A1, B1, ...
-        for s in range(max(nA, nB)):
-            if s < nA:
-                a = max(0, s*P - row_window_slack)
-                b = min(len(A), (s+1)*P + row_window_slack)
-                allowed.append(set(A[a:b])); row_of_group.append(rA)
-            if len(allowed) >= S: break
-            if rB is not None and s < nB:
-                a = max(0, s*P - row_window_slack)
-                b = min(len(B), (s+1)*P + row_window_slack)
-                allowed.append(set(B[a:b])); row_of_group.append(rB)
-            if len(allowed) >= S: break
-        if len(allowed) >= S: break
-
-    # fallback (se strict_rows=False e mancano gruppi)
-    if len(allowed) < S:
-        rest = set(i for r in rows for i in by_row[r])
-        while len(allowed) < S:
-            allowed.append(set(rest)); row_of_group.append(None)
-
-    return allowed, row_of_group, row_idx
-
-
+    # se nessuna run è FEASIBLE/OPTIMAL, ritorna l’ultima (best_pack resta None)
+    if best_pack is not None:
+        return best_pack
+    else:
+        return status, solver, x, r, L, z1, z2, E, T
     
+
+
 def preview_pair_snake(coords, E, P, start_corner="TL", title=None):
     import matplotlib.pyplot as plt
     order, row_idx, rows = build_pair_snake_path(coords, E, start_corner)
@@ -559,61 +675,52 @@ def build_serpentine_path(coords: np.ndarray, E, start_corner: str = "BL"):
 
     return order, row_idx, rows_sorted
 
-def preview_serpentine_path(coords, order, P, title="Serpentina", R=None):
+def preview_serpentine_path(coords: np.ndarray, order, row_idx, P,
+                            title="Serpentina (solo guida)"):
     import matplotlib.pyplot as plt
     import matplotlib.colors as mcolors
-    from matplotlib.patches import Circle
-    import numpy as np
 
-    N = len(order)
-    G = max(1, N // P)
+    # normalizza y per righe orizzontali
+    rows = sorted(set(row_idx))
+    y_map = {r: i for i, r in enumerate(rows)}
+    xs = np.arange(len(order))
+    ys = np.array([y_map[row_idx[i]] for i in order], dtype=float)
+
+    # colori per blocchi da P
     palette = list(mcolors.TABLEAU_COLORS.values())
-    col = lambda g: palette[g % len(palette)]
+    colors = [palette[(k // P) % len(palette)] for k in range(len(order))]
 
-    fig, ax = plt.subplots(figsize=(12, 7), dpi=130)
+    fig, ax = plt.subplots(figsize=(14, 6), dpi=130)
+    ax.scatter(xs, ys, s=18, c=colors, alpha=0.9, edgecolors="none")
 
-    # disegno cerchi
-    if R is not None and R > 0:
-        for (x0, y0) in coords:
-            ax.add_patch(Circle((x0, y0), R, facecolor="white",
-                                edgecolor="0.8", linewidth=0.6, zorder=1))
-    else:
-        ax.scatter(coords[:,0], coords[:,1], s=10, c="white",
-                   edgecolors="0.8", linewidths=0.6, zorder=1)
+    # separatori ogni P
+    for g in range(len(order) // P + 1):
+        xg = g * P - 0.5
+        ax.axvline(xg, color="k", lw=0.6, alpha=0.25)
 
-    # percorso sui centri (a pezzi colorati per gruppo)
-    for t in range(N-1):
-        i, j = order[t], order[t+1]
-        g = t // P
-        xi, yi = coords[i]; xj, yj = coords[j]
-        ax.plot([xi, xj], [yi, yj], lw=2.0, color=col(g), zorder=3)
+    # frecce tra centroidi dei blocchi (1→2→…)
+    from math import floor
+    G = floor(len(order) / P)
+    for g in range(G - 1):
+        a = g * P
+        b = (g + 1) * P
+        c = (g + 1) * P
+        d = (g + 2) * P
+        x0 = np.mean(xs[a:b]); y0 = np.mean(ys[a:b])
+        x1 = np.mean(xs[c:d]); y1 = np.mean(ys[c:d])
+        ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                    arrowprops=dict(arrowstyle="->", lw=1.5, color="black"))
+        ax.text((x0+x1)/2, (y0+y1)/2, f"{g+1}", ha="center", va="center",
+                fontsize=9, bbox=dict(boxstyle="circle,pad=0.2", fc="white"))
 
-    # frecce tra fine slot g e inizio slot g+1
-    for g in range(G-1):
-        a = g*P; b = (g+1)*P
-        p0 = coords[order[b-1]]; p1 = coords[order[b]]
-        ax.annotate("", xy=(p1[0], p1[1]), xytext=(p0[0], p0[1]),
-                    arrowprops=dict(arrowstyle="->", lw=1.6, color="k"))
-
-        # numerino del gruppo
-        idx = order[a:b]
-        C = coords[idx].mean(axis=0)
-        ax.text(C[0], C[1], f"{g+1}", ha="center", va="center",
-                fontsize=9, bbox=dict(boxstyle="circle,pad=0.25",
-                fc="white", ec="black", alpha=0.9))
-
-    # start / end
-    xs, ys = coords[order[0]]; xe, ye = coords[order[-1]]
-    ax.plot(xs, ys, "o", mfc="lime", mec="k"); ax.text(xs, ys, "start", ha="left", va="bottom")
-    ax.plot(xe, ye, "o", mfc="red",  mec="k"); ax.text(xe, ye, "end",   ha="left", va="bottom")
-
-    xs_all, ys_all = coords[:,0], coords[:,1]
-    pad = R if R else 5
-    ax.set_xlim(xs_all.min()-2*pad, xs_all.max()+2*pad)
-    ax.set_ylim(ys_all.max()+2*pad, ys_all.min()-2*pad)  # y verso il basso
-    ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+    ax.set_ylim(-0.7, len(rows)-0.3)
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([f"r{r}" for r in rows])
+    ax.set_xlabel("indice lungo serpentina")
     ax.set_title(title)
-    plt.tight_layout(); plt.show()
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
 def pca_axes(coords: np.ndarray):
     """Restituisce unit vectors (e1, e2) con e1 = asse di massima varianza."""
@@ -663,125 +770,265 @@ def build_graph(coords: np.ndarray, R: float, tol: float) -> Tuple[List[Tuple[in
     return E, A
 
 
+def build_acyclic_arcs(coords: np.ndarray, E, orient_axis: np.ndarray | None = None):
+    """
+    Orienta gli archi non direzionali E in modo aciclico lungo 'orient_axis'.
+    Se orient_axis è None, usa e1 (asse di massima varianza).
+    Restituisce:
+      A_dir   : lista di archi diretti (u,v)
+      incoming: dict i -> lista di archi (u,i) entranti
+    """
+    if orient_axis is None:
+        e1, _ = pca_axes(coords)
+        axis = e1
+    else:
+        axis = orient_axis / np.linalg.norm(orient_axis)
+
+    s = coords @ axis  # proiezione scalare lungo l’asse scelto
+
+    def orient(i, j):
+        if s[i] < s[j]:
+            return (i, j)
+        if s[i] > s[j]:
+            return (j, i)
+        # tie-break stabile per evitare cicli quando s[i] == s[j]
+        return (i, j) if i < j else (j, i)
+
+    A_dir = [orient(i, j) for (i, j) in E]
+    incoming = {i: [] for i in range(len(coords))}
+    for (u, v) in A_dir:
+        incoming[v].append((u, v))
+    return A_dir, incoming
+
+
 def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
-                 time_limit: int = 60, alpha: float = 0.1, seed: int = 0,
-                 degree_cap=4, Lmin=0,                  # tieni 0 per i primi test
-                 start_corner: str = "TL",
-                 window_slack: int = 1,                     # 0=solo riga target; 1=anche righe adiacenti
-                 strict_rows: bool = True):                   # quante celle possono uscire dalla riga target
+                 time_limit: int = 60, alpha: float = 0.1, seed: int = 0, Lmin=1,
+                 degree_cap=4, enforce_degree: bool = False,
+                 cp_params: dict | None = None, use_hole_penality=False, stripe_mode="auto"):
     N = len(coords)
     if S * P > N:
         raise SystemExit(f"Celle richieste {S*P} > disponibili {N}")
 
-    E, A = build_graph(coords, R, tol)
-    print(f"[graph] N={N} |E|={len(E)} |A|={len(A)}")
+    # --- grafo non diretto + assi ---
+    E, _ = build_graph(coords, R, tol)
+    e1, e2 = pca_axes(coords)
 
-    # Piano serpentina basato su DIREZIONE
-    # --- serpentina verticale a colonne di slot ---
-    allowed_sets, row_of_group, order_list, row_idx = \
-        build_vertical_slot_snake_allowed_sets(
-            coords, E, S, P,
-            start_corner=start_corner,    # "BL" = parti in basso a sinistra e sali
-            slot_slack=window_slack,      # 0..2 di solito basta
-            strict=strict_rows            # se True richiede capienza piena in slot
-        )
-    print("[snake columns] rows:", row_of_group[:min(S,10)], " ...")
+    # --- euristica righe/colonne ---
+    row_of_h, pos_in_row_h, rows_h, row_counts_h, C_complete_h = _infer_rows_and_positions_hex(coords, E)
+    rect_like = is_quadrangular_by_rows(row_counts_h)
 
-    # --- modello ---
+    # adesso consentiamo colonne se: forma "rettangolare", R>=P, C_complete>=S
+    can_hex_cols = (stripe_mode in ("auto","columns")) and rect_like \
+                and (len(rows_h) >= P) and (C_complete_h >= S)
+
+
+    # --- colonne esagonali SOLO se: forma rettangolare, P == #righe, e ci sono almeno S colonne complete
+    
+
+    orient_axis = e2 if can_hex_cols else e1
+    A, incoming = build_acyclic_arcs(coords, E, orient_axis=orient_axis)
+
+    # (DEBUG) quanti nodi hanno 0 archi entranti lungo l'asse scelto?
+    deg_in = np.array([len(incoming[v]) for v in range(N)], int)
+    print("nodi con deg_in=0:", int((deg_in == 0).sum()))
+
+    # --- vicinati, ecc. ---
+    neighbors = {i: [] for i in range(N)}
+    for (i, j) in E:
+        neighbors[i].append(j); neighbors[j].append(i)
+    interior_idx = [i for i in range(N) if len(neighbors[i]) == 6]
+
+    # Celle di bordo: grado < 6 (su honeycomb regolare è un’ottima proxy del perimetro)
+    boundary_mask = np.array([1 if len(neighbors[i]) < 6 else 0 for i in range(N)], dtype=int)
+
+    # === model & variabili ===
     model = cp_model.CpModel()
     rng = np.random.default_rng(seed)
 
-    # decision vars + blocco fuori banda
     x, r = {}, {}
     for i in range(N):
         for k in range(S):
-            xi = model.NewBoolVar(f"x[{i},{k}]")
-            x[(i,k)] = xi
-            if i not in allowed_sets[k]:
-                model.Add(xi == 0)
+            x[(i,k)] = model.NewBoolVar(f"x[{i},{k}]")
             r[(i,k)] = model.NewBoolVar(f"r[{i},{k}]")
 
+    use = {}
+    for i in range(N):
+        use[i] = model.NewIntVar(0, 1, f"use[{i}]")
+        model.Add(use[i] == sum(x[(i,k)] for k in range(S)))
 
-
-    # group sizes
+    # (1) gruppi da P celle, (2) ogni cella al più una volta, (3) una root per gruppo
     for k in range(S):
         model.Add(sum(x[(i,k)] for i in range(N)) == P)
-
-    # each cell at most one group
-    for i in range(N):
-        model.Add(sum(x[(i,k)] for k in range(S)) <= 1)
-
-    
-
-    
-    # roots + flussi per connettività (come prima)
-    for k in range(S):
         model.Add(sum(r[(i,k)] for i in range(N)) == 1)
         for i in range(N):
             model.Add(r[(i,k)] <= x[(i,k)])
+    for i in range(N):
+        model.Add(sum(x[(i,k)] for k in range(S)) <= 1)
 
-    f = {}
-    cap = P - 1
-    for (i,j) in A:
+    # --- STRIPE GUIDANCE (dopo che esistono model e x!) ---
+    stripe_applied = False
+    if can_hex_cols:
+        add_hex_column_block_stripes(
+            model, x, S, P,
+            row_of=row_of_h, pos_in_row=pos_in_row_h,
+            rows=rows_h, C_complete=C_complete_h,
+            force_consecutive_cols=True   # o False se vuoi libertà
+        )
+        stripe_applied = True
+
+    # Fallback a RIGHE solo se forma rettangolare e ci sono almeno S righe con >= P celle
+    if (not stripe_applied) and (stripe_mode in ("auto","rows")):
+        rows_geP = int((row_counts_h >= P).sum())
+        if rect_like and rows_geP >= S:
+            add_row_block_stripes(
+                model, x, S, P,
+                row_of=row_of_h,
+                pos_in_row=pos_in_row_h,
+                rows=rows_h,
+                row_counts=row_counts_h
+            )
+            stripe_applied = True
+    # (altrimenti nessuna guida)
+
+    # --- connettività: parent-edge su A (già orientato correttamente) ---
+    y = {}
+    for (i, j) in A:
         for k in range(S):
-            f[(i,j,k)] = model.NewIntVar(0, cap, f"f[{i}->{j},{k}]")
-            model.Add(f[(i,j,k)] <= cap * x[(i,k)])
-            model.Add(f[(i,j,k)] <= cap * x[(j,k)])
+            y[(i, j, k)] = model.NewBoolVar(f"y[{i}->{j},{k}]")
+            model.Add(y[(i, j, k)] <= x[(i, k)])
+            model.Add(y[(i, j, k)] <= x[(j, k)])
 
-    out_arcs = defaultdict(list)
-    in_arcs = defaultdict(list)
-    for (i,j) in A:
-        out_arcs[i].append((i,j))
-        in_arcs[j].append((i,j))
-
+    # per ogni nodo selezionato: o root o esattamente 1 genitore
     for k in range(S):
         for i in range(N):
-            model.Add(
-                sum(f[(u,v,k)] for (u,v) in in_arcs[i])
-                - sum(f[(u,v,k)] for (u,v) in out_arcs[i])
-                == x[(i,k)] - P * r[(i,k)]
-            )
+            model.Add(sum(y[(u, i, k)] for (u, _v) in incoming[i]) + r[(i, k)] == x[(i, k)])
 
-    # link z1/z2 e grado termico
+    # albero per gruppo: #archi = #nodi - 1
+    for k in range(S):
+        model.Add(sum(y[(i, j, k)] for (i, j) in A) == sum(x[(i, k)] for i in range(N)) - 1)
+
+
+    # --- Single-cell holes (opzionale): definisci sempre holes per evitare NameError ---
+    holes = []   # sarà una lista di BoolVar; se non usata resta vuota
+
+    if use_hole_penality:
+        for i in interior_idx:
+            # g[i] = AND_{j in N(i)} use[j]   (tutti i vicini usati?)
+            gi = model.NewBoolVar(f"allN_used[{i}]")
+            for j in neighbors[i]:
+                model.Add(gi <= use[j])
+            m = len(neighbors[i])
+            model.Add(gi >= sum(use[j] for j in neighbors[i]) - (m - 1))
+
+            # h[i] = (1 - use[i]) AND gi  → buco singolo
+            hi = model.NewBoolVar(f"hole[{i}]")
+            model.Add(hi <= 1 - use[i])
+            model.Add(hi <= gi)
+            model.Add(hi >= gi - use[i])
+            holes.append(hi)
+
+
+    # ------ NUOVO: buco multi-cella (componenti interne dei NON-assegnati) ------
+    HOLE_MODE = "penalize"   # "forbid" per vietarli del tutto
+    hole_vars = add_unused_component_forest(
+        model,
+        N=N,
+        A_dir=A,             # DAG che hai già costruito con build_acyclic_arcs
+        incoming=incoming,
+        use=use,
+        boundary_mask=boundary_mask,
+        mode=HOLE_MODE
+    )
+
+            
+
+
+    # --- (5) Link tra gruppi consecutivi (z1/z2) su TUTTI gli archi E ---
     L = []
-    per_cell_degree = [model.NewIntVar(0, degree_cap, f"deg[{i}]") for i in range(N)]
-    deg_expr = [0 for _ in range(N)]
+    z1, z2 = {}, {}
     for k in range(S-1):
-        Lk = model.NewIntVar(0, len(E), f"L[{k}]")
+        Lk = model.NewIntVar(0, max(1, 2*len(E)), f"L[{k}]")
         link_terms = []
-        for (i,j) in E:
-            z1 = model.NewBoolVar(f"z1[{k},{i}-{j}]")
-            z2 = model.NewBoolVar(f"z2[{k},{i}-{j}]")
-            model.Add(z1 <= x[(i,k)])
-            model.Add(z1 <= x[(j,k+1)])
-            model.Add(z2 <= x[(j,k)])
-            model.Add(z2 <= x[(i,k+1)])
-            link_terms += [z1, z2]
-            deg_expr[i] = deg_expr[i] + z1 + z2
-            deg_expr[j] = deg_expr[j] + z1 + z2
-        model.Add(Lk == sum(link_terms))
+        for (i, j) in E:
+            z1[(k,i,j)] = model.NewBoolVar(f"z1[{k},{i}-{j}]")  # i in k, j in k+1
+            z2[(k,i,j)] = model.NewBoolVar(f"z2[{k},{i}-{j}]")  # j in k, i in k+1
+            model.Add(z1[(k,i,j)] <= x[(i,k)])
+            model.Add(z1[(k,i,j)] <= x[(j,k+1)])
+            model.Add(z2[(k,i,j)] <= x[(j,k)])
+            model.Add(z2[(k,i,j)] <= x[(i,k+1)])
+            link_terms += [z1[(k,i,j)], z2[(k,i,j)]]
+        model.Add(Lk == sum(link_terms)) if link_terms else model.Add(Lk == 0)
         if Lmin > 0:
             model.Add(Lk >= Lmin)
         L.append(Lk)
 
-    for i in range(N):
-        model.Add(per_cell_degree[i] == deg_expr[i])
-        model.Add(per_cell_degree[i] <= degree_cap)
+    # (OPZ) limite di grado – off per default
+    if enforce_degree:
+        per_cell_degree = [model.NewIntVar(0, degree_cap, f"deg[{i}]") for i in range(N)]
+        deg_expr = [0 for _ in range(N)]
+        for k in range(S-1):
+            for (i, j) in E:
+                deg_expr[i] = deg_expr[i] + z1[(k,i,j)] + z2[(k,i,j)]
+                deg_expr[j] = deg_expr[j] + z1[(k,i,j)] + z2[(k,i,j)]
+        for i in range(N):
+            model.Add(per_cell_degree[i] == deg_expr[i])
+            model.Add(per_cell_degree[i] <= degree_cap)
 
-    # obiettivo
-    if len(L) > 0:
-        ALPHA = int(alpha * 100)
-        model.Maximize(100 * sum(L))
+
+
+    # --- Obiettivo: copertura, minimo T, somma contatti, penalità buchi ---
+    T = None
+    if L:
+        # b[k] = 1 se Lk >= 1 (gruppo k connesso al successivo)
+        b = []
+        for k, Lk in enumerate(L):
+            bk = model.NewBoolVar(f"connected[{k}]")
+            model.Add(Lk >= bk)
+            b.append(bk)
+
+        # T = min_k Lk
+        T = model.NewIntVar(0, 2 * P, "T_min_links")
+        for Lk in L:
+            model.Add(T <= Lk)
+
+        # pesi
+        wCover, wT, wSum = 10_000, 1_000, 100
+        wHole1 = 150   # penalità single-cell (se attiva)
+        wHoleComp = 600  # penalità per ogni componente interna di non-assegnati
+
+        obj = wCover * sum(b) + wT * T + wSum * sum(L)
+
+        # nuova penalità per buchi multi-cella (quante componenti interne)
+        hole_comp_term = hole_vars.get("n_holes", None)
+        if hole_comp_term is not None:
+            obj -= wHoleComp * hole_comp_term
+
+        # vecchia penalità single-cell (solo se attivata)
+        if use_hole_penality and holes:
+            obj -= wHole1 * sum(holes)
+
+        model.Maximize(obj)
     else:
         model.Maximize(0)
 
+    # --- Solver settings + override (auto-tuning) ---
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = float(time_limit)
-    solver.parameters.num_search_workers = 8
+    solver.parameters.num_search_workers = -1       # usa tutti i core
+    solver.parameters.cp_model_presolve = True
+    solver.parameters.cp_model_probing_level = 2
+    solver.parameters.linearization_level = 2
+    solver.parameters.search_branching = cp_model.PORTFOLIO_SEARCH
+    solver.parameters.symmetry_level = 2
+    solver.parameters.randomize_search = True
     solver.parameters.log_search_progress = True
+    if cp_params:
+        for k, v in cp_params.items():
+            setattr(solver.parameters, k, v)
 
     status = solver.Solve(model)
-    return status, solver, x, r, L, {}, {}, E  # z1/z2 locali; restituisco dict vuoti per compatibilità
+    return status, solver, x, r, L, z1, z2, E, T
+
 
 
 def plot_solution(coords, R, S, x, z1, z2, E, L, solver,
@@ -819,22 +1066,14 @@ def plot_solution(coords, R, S, x, z1, z2, E, L, solver,
         fc = color_for_group(gid) if gid >= 0 else "white"
         ax.add_patch(Circle((x0,y0), R, facecolor=fc, edgecolor="black", linewidth=0.6, zorder=2))
 
-    # --- link tra gruppi successivi dedotti dall'assegnazione ---
-    Lk_drawn = {}
+    # disegna contatti effettivi tra gruppi successivi (linee sottili grigie)
     if show_links:
         for k in range(S-1):
-            cnt = 0
-            for (i, j) in E:
-                gi = assigned_group[i]
-                gj = assigned_group[j]
-                if (gi == k and gj == k+1) or (gi == k+1 and gj == k):
+            for (i,j) in E:
+                if solver.BooleanValue(z1[(k,i,j)]) or solver.BooleanValue(z2[(k,i,j)]):
                     xi, yi = coords[i]
                     xj, yj = coords[j]
-                    ax.plot([xi, xj], [yi, yj], linewidth=1.0, alpha=0.5,
-                            color="black", zorder=3)
-                    cnt += 1
-            Lk_drawn[k] = cnt
-
+                    ax.plot([xi, xj], [yi, yj], linewidth=1.0, alpha=0.5, color="black", zorder=3)
 
     # frecce con ordine (k -> k+1) e label con #link
     if show_arrows:
@@ -849,7 +1088,7 @@ def plot_solution(coords, R, S, x, z1, z2, E, L, solver,
                     zorder=4
                 )
                 # etichetta ordine (1..S-1) e #link
-                lk = Lk_drawn.get(k, 0)
+                lk = int(solver.Value(L[k])) if L else 0
                 xm, ym = (0.5*(x0+x1), 0.5*(y0+y1))
                 ax.text(xm, ym, f"{k+1}\n({lk})", ha="center", va="center",
                         fontsize=9, bbox=dict(boxstyle="circle,pad=0.25", fc="white", ec="black", alpha=0),
@@ -878,55 +1117,53 @@ def plot_solution(coords, R, S, x, z1, z2, E, L, solver,
 
 def main():
 
-    csv = "new_version/out.csv"
-    S=7
-    P=9
-    radius=9.0
-    tol=2.5
-    time_limit=120
-    alpha=0.1
-    degree_cap=6
-    Lmin=2
-    start_corner = "TL"
-    strict_rows=False
-    window_slack=1
 
-    
+
+    csv = "out.csv"
+    S = 10
+    P =5
+    radius = 9.0
+    tol = 2
+    time_budget = 30
+    degree_cap = 6
+    enforce_degree = False
+    target_T=2*P
+    use_hole_penality=False
 
     df = pd.read_csv(csv)
     coords = df[['x','y']].to_numpy()
 
-    E, A = build_graph(coords, radius, tol)
-
-    # Preview della serpentina VERTICALE (colonne di slot)
-    allowed_sets, row_of_group, order_list, row_idx = \
-    build_vertical_slot_snake_allowed_sets(coords, E, S, P,
-                                           start_corner="BL",
-                                           slot_slack=1, strict=False)
-    preview_serpentine_path(coords, order_list, P, title="Serpentina verticale (slot)", R=radius)
-
-
-    status, solver, x, r, L, z1, z2, E = solve_layout(
+    # tuning senza snake
+    pack = auto_tune_and_solve(
         coords, S, P, radius, tol,
-        time_limit=time_limit, alpha=alpha, degree_cap=degree_cap, Lmin=Lmin,
-        start_corner=start_corner, strict_rows=strict_rows, window_slack=window_slack
+        time_budget=time_budget,
+        target_T=target_T,             
+        degree_cap=degree_cap,
+        enforce_degree=enforce_degree,
+        profiles=("fast","fast","quality"),
+        seeds=(0,1,2,3),
+        workers=6,
+        use_hole_penality=use_hole_penality,
+        stripe_mode="auto"
     )
 
+    status, solver, x, r, L, z1, z2, E, T = pack
     status_name = {cp_model.OPTIMAL:"OPTIMAL", cp_model.FEASIBLE:"FEASIBLE",
-                   cp_model.INFEASIBLE:"INFEASIBLE", cp_model.MODEL_INVALID:"MODEL_INVALID",
-                   cp_model.UNKNOWN:"UNKNOWN"}.get(status, str(status))
+                    cp_model.INFEASIBLE:"INFEASIBLE", cp_model.MODEL_INVALID:"MODEL_INVALID",
+                    cp_model.UNKNOWN:"UNKNOWN"}.get(status, str(status))
     print("Solver status:", status_name)
+
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        if L:
-            links=[int(solver.Value(v)) for v in L]
-            print("Links between successive groups:", links, "  avg:", sum(links)/len(links))
+        links = [int(solver.Value(v)) for v in L]
+        tval = solver.Value(T) if T is not None else None
+        print(f"min_k Lk = {tval}   sum(L) = {sum(links)}   per-k: {links}")
         plot_solution(
             coords, radius, S, x, z1, z2, E, L, solver,
             title=f"{S}S{P}P — CP-SAT ({status_name})",
             save=None, show_links=True, show_arrows=True
         )
     else:
-        print("Nessuna soluzione trovata con i vincoli dati nel tempo limite.")
+        print("Nessuna soluzione trovata entro il budget.")
 
 
 if __name__ == "__main__":
