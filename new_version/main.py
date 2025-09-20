@@ -497,7 +497,7 @@ def elabora_dati(input_file_path: str):
             continue
 
         # Parametri solver (tieni i tuoi default preferiti)
-        time_budget = 30
+        time_budget = 120
         tol = 2.0
         degree_cap = 6
         enforce_degree = False

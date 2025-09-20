@@ -1,6 +1,3 @@
-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 CP-SAT battery layout optimizer
 
@@ -39,23 +36,12 @@ USO:
   python battery_layout_cpsat.py --csv out.csv --S 25 --P 9 --radius 9 --tol 0.8 --time_limit 60 --save fig.png
 """
 
-import argparse
-from collections import defaultdict
-from typing import List, Tuple, Dict
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from matplotlib.patches import Circle, Polygon
-
 from ortools.sat.python import cp_model
-
 import numpy.linalg as npl
-
-from shapely.geometry.polygon import orient
-import numpy.linalg as npl
-from ortools.sat.python import cp_model
-
 
 
 def add_unused_component_forest(
@@ -248,6 +234,31 @@ def _infer_rows_and_positions_hex(coords, E):
     row_counts = np.array([len(by_row[r]) for r in rows], dtype=int)
     C_complete = int(row_counts.min()) if len(row_counts) else 0
     return row_of, pos_in_row, rows, row_counts, C_complete
+
+
+def add_consecutive_rows_block(model, x, S, P, row_of, rows):
+    R = len(rows)
+    y = {(k,r): model.NewBoolVar(f"use_row[{k},{r}]") for k in range(S) for r in rows}
+    start = {(k,r0): model.NewBoolVar(f"rowblk_start[{k},{r0}]")
+             for k in range(S) for r0 in range(0, R - P + 1)}
+
+    for k in range(S):
+        model.Add(sum(start[(k,r0)] for r0 in range(0, R - P + 1)) == 1)
+
+        for pos_r, r in enumerate(rows):
+            # **FIX**: copertura in funzione della POSIZIONE di r nella lista "rows"
+            covers = [start[(k,r0)] for r0 in range(0, R - P + 1)
+                      if r0 <= pos_r <= r0 + (P - 1)]
+            if covers:
+                model.Add(y[(k,r)] == sum(covers))   # è 0/1 perché c'è un solo start
+            else:
+                model.Add(y[(k,r)] == 0)
+
+            idx_r = [i for i in range(len(row_of)) if row_of[i] == r]
+            if idx_r:
+                model.Add(sum(x[(i,k)] for i in idx_r) == y[(k,r)])
+            else:
+                model.Add(y[(k,r)] == 0)
 
 def add_hex_column_block_stripes(model, x, S, P,
                                  row_of, pos_in_row, rows, C_complete,
@@ -454,7 +465,7 @@ def auto_tune_and_solve(coords, S, P, R, tol,
 
         status, solver, x, r, L, z1, z2, E, T = solve_layout(
             coords, S, P, R, tol,
-            time_limit=per_run, alpha=0.0, Lmin=6,
+            time_limit=per_run, alpha=0.0, Lmin=0,
             degree_cap=degree_cap, enforce_degree=enforce_degree,
             cp_params=cp_params, use_hole_penality=False,
             stripe_mode=stripe_mode
@@ -622,39 +633,35 @@ def snake_allowed_sets(coords, E, S, P, start_corner="TL", window_slack=2):
     return allowed, order, row_idx
 
 
-def axis_order_allowed_sets(coords, S, P, axis=None, start_end="min", window_slack=2):
-    """
-    Restringe i gruppi a finestre contigue lungo l'asse 'axis' (default: PCA e1).
-    - start_end: "min" = parte dall'estremo con s minimo; "max" = dall'altro estremo.
-    Ritorna: (allowed, order) dove allowed[k] è un set di indici ammessi per il gruppo k.
-    """
+def axis_order_allowed_sets(coords, S, P, axis=None, start_end="min",
+                            window_slack=2, row_of=None):
     if axis is None:
-        e1, _ = pca_axes(coords)
-        axis = e1
+        e1, _ = pca_axes(coords); axis = e1
     axis = axis / np.linalg.norm(axis)
-
     s = coords @ axis
-    order = np.argsort(s)              # dal più piccolo al più grande
+    order = np.argsort(s)
     if start_end == "max":
-        order = order[::-1]            # inverti: parti dal lato opposto
+        order = order[::-1]
 
     N = len(coords)
-    pos = np.empty(N, dtype=int)
-    pos[order] = np.arange(N)
+    pos = np.empty(N, dtype=int); pos[order] = np.arange(N)
 
     allowed = []
     for k in range(S):
-        a = k * P
-        b = (k + 1) * P - 1
-        w = window_slack
+        a = k * P; b = (k + 1) * P - 1
+        w = max(window_slack, P)   # finestra iniziale un po' più larga
         while True:
-            lo = max(0, a - w)
-            hi = min(N - 1, b + w)
+            lo = max(0, a - w); hi = min(N - 1, b + w)
             idx = [i for i in range(N) if lo <= pos[i] <= hi]
-            if len(idx) >= P or (lo == 0 and hi == N - 1):
+            if row_of is not None:
+                n_rows = len({int(row_of[i]) for i in idx})
+                ok = (n_rows >= P)
+            else:
+                ok = (len(idx) >= P)
+            if ok or (lo == 0 and hi == N - 1):
                 allowed.append(set(idx))
                 break
-            w += 1                      # auto-allarga se non bastano P celle
+            w += 1   # allarga finché non ci sono P righe distinte
     return allowed, order
 
 
@@ -846,11 +853,11 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
     rect_like = is_quadrangular_by_rows(row_counts_h)
     can_hex_cols = (stripe_mode in ("auto","columns")) and rect_like and (len(rows_h) >= P) and (C_complete_h >= S)
 
-    # 3) DAG SOLO per la foresta dei NON-assegnati (holes)  
+    # 3) DAG SOLO per la foresta dei NON-assegnati (holes)  <-- KEEP
     orient_axis_holes = e2 if can_hex_cols else e1
     A_dir_holes, incoming_holes = build_acyclic_arcs(coords, E, orient_axis=orient_axis_holes)
 
-    # 4) Connettività DEI GRUPPI sui bidirezionali            
+    # 4) Connettività DEI GRUPPI sui bidirezionali            <-- KEEP
     A = A_bidir
     incoming = {i: [] for i in range(N)}
     for (u, v) in A:
@@ -892,24 +899,48 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
         model.Add(use[i] == sum(x[(i,k)] for k in range(S)))
 
 
-    # --- GUIDA LUNGO ASSE PRINCIPALE (modo "axis") ---
-    if stripe_mode == "axis":
-        # usa l'asse principale già calcolato (e1) e parti dall'estremo "min"
-        allowed, order_axis = axis_order_allowed_sets(
-            coords, S, P, axis=e1, start_end="min",
-            window_slack=max(3, P//2)      # prima era 2
-        )
-        N = len(coords)
-        for k in range(S):
-            allow_k = allowed[k]
-            for i in range(N):
-                if i not in allow_k:
-                    model.Add(x[(i,k)] == 0)
+    # vincolo “striscia”: P righe consecutive, 1 cella per riga
+    #add_consecutive_rows_block(model, x, S, P, row_of_h, rows_h)
 
-        # almeno una cella del gruppo 0 tra le prime K dell’asse
-        K = max(3, P)                      # es. prime 5 se P=5
-        start_pool = list(order_axis[:K])
-        model.Add(sum(x[(i,0)] for i in start_pool) >= 1)
+
+    # --- GUIDA LUNGO ASSE PRINCIPALE (modo "axis") ---
+    '''if stripe_mode == "axis":
+            # usa l'asse principale già calcolato (e1) e parti dall'estremo "min"
+            allowed, order_axis = axis_order_allowed_sets(
+                coords, S, P, axis=e1, start_end="min",
+                window_slack=2, row_of=row_of_h
+            )
+            N = len(coords)
+            for k in range(S):
+                allow_k = allowed[k]
+                for i in range(N):
+                    if i not in allow_k:
+                        model.Add(x[(i,k)] == 0)
+
+            # calcola degree per distinguere angoli
+            deg = np.array([len(neighbors[i]) for i in range(N)])
+            corner = deg <= 2
+            edge = (boundary_mask == 1) & (~corner)
+
+            order_axis = np.argsort(coords @ e1)
+            K = max(3, P)
+
+            start_pool = [i for i in order_axis if edge[i]][:K]
+            if not start_pool:  # fallback: bordo (anche angoli) oppure semplicemente le prime K
+                start_pool = [i for i in order_axis if boundary_mask[i] == 1][:K] or list(order_axis[:K])
+
+            # esattamente 1 root di G0 nello start_pool
+            model.Add(sum(r[(i,0)] for i in start_pool) == 1)
+            for i in range(N):
+                if i not in start_pool:
+                    model.Add(r[(i,0)] == 0)'''
+
+    # al massimo una cella per riga in ogni gruppo
+    #if len(rows_h) >= P:
+    #    for k in range(S):
+    #        for rr in rows_h:
+    #            idx_r = [i for i in range(N) if row_of_h[i] == rr]
+    #            model.Add(sum(x[(i,k)] for i in idx_r) <= 1)
 
     # --- exp[i] = cella esposta (bordo oppure ha almeno un vicino non usato) ---
     exp, outN = {}, {}
@@ -956,30 +987,32 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
     for i in range(N):
         model.Add(sum(x[(i,k)] for k in range(S)) <= 1)
 
-    # --- STRIPE GUIDANCE (dopo che esistono model e x!) ---
+    # --- STRIPE GUIDANCE: solo per forme rettangolari ---
     stripe_applied = False
-    if can_hex_cols:
-        add_hex_column_block_stripes(
-            model, x, S, P,
-            row_of=row_of_h, pos_in_row=pos_in_row_h,
-            rows=rows_h, C_complete=C_complete_h,
-            force_consecutive_cols=True   # o False se vuoi libertà
-        )
-        stripe_applied = True
 
-    # Fallback a RIGHE solo se forma rettangolare e ci sono almeno S righe con >= P celle
-    if (not stripe_applied) and (stripe_mode in ("auto","rows")):
-        rows_geP = int((row_counts_h >= P).sum())
-        if rect_like and rows_geP >= S:
-            add_row_block_stripes(
+    # rect_like = True se le righe hanno ~la stessa lunghezza (già calcolato)
+    rows_geP = int((row_counts_h >= P).sum())
+
+    if rect_like and len(rows_h) >= P:
+        # 1) prova colonne esagonali (serve avere almeno S colonne complete)
+        if (C_complete_h >= S) and (stripe_mode in ("rect", "columns", "auto")):
+            add_hex_column_block_stripes(
                 model, x, S, P,
-                row_of=row_of_h,
-                pos_in_row=pos_in_row_h,
-                rows=rows_h,
-                row_counts=row_counts_h
+                row_of=row_of_h, pos_in_row=pos_in_row_h,
+                rows=rows_h, C_complete=C_complete_h,
+                force_consecutive_cols=True
             )
             stripe_applied = True
-    # (altrimenti nessuna guida)
+
+        # 2) altrimenti, fallback su righe (sempre rettangolare)
+        elif (rows_geP >= S) and (stripe_mode in ("rect", "rows", "auto")):
+            add_row_block_stripes(
+                model, x, S, P,
+                row_of=row_of_h, pos_in_row=pos_in_row_h,
+                rows=rows_h, row_counts=row_counts_h
+            )
+            stripe_applied = True
+
 
     # --- connettività: parent-edge su A (già orientato correttamente) ---
     y = {}
@@ -1089,7 +1122,7 @@ def solve_layout(coords: np.ndarray, S: int, P: int, R: float, tol: float,
             model.Add(T <= Lk)
 
         # pesi
-        wCover, wT, wSum = 10_000, 1_000, 100
+        wCover, wT, wSum = 10_000, 5_000, 1
         wHole1     = 150    # micro-buchi (se attivati)
         wHoleComp  = 600    # componenti interne non-assegnate
         wEndExpose = 2_000  # estremi non esposti
@@ -1229,189 +1262,6 @@ def plot_solution(coords, R, S, x, z1, z2, E, L, solver,
     plt.tight_layout()
     if save:
         plt.savefig(save, bbox_inches="tight", dpi=160)
-    plt.show()
-
-
-
-def _edge_labels(ax, poly: Polygon, offset_mm: float,
-                 fontsize=12, box_fc="white", zorder=20):
-    """
-    Scrive le quote (mm) su tutti i lati dell'anello esterno.
-    Il poligono è atteso in mm e con asse Y verso l'alto.
-    """
-    # Forza orientazione CCW dell’anello esterno
-    ext = np.asarray(orient(poly, sign=1.0).exterior.coords)
-
-    for (x1, y1), (x2, y2) in zip(ext[:-1], ext[1:]):
-        dx, dy = (x2 - x1), (y2 - y1)
-        L = float(np.hypot(dx, dy))
-        if L <= 1e-9:
-            continue
-        # punto medio e normale esterna (per CCW → (dy, -dx))
-        mx, my = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-        nx, ny = dy / L, -dx / L
-        ax.text(mx + offset_mm * nx,
-                my + offset_mm * ny,
-                f"{L:.1f} mm",
-                ha="center", va="center",
-                fontsize=fontsize,
-                bbox=dict(boxstyle="round,pad=0.25",
-                          fc=box_fc, ec="0.3", alpha=0.96),
-                zorder=zorder)
-
-
-def plot_solution2(coords, R, S, x, z1, z2, E, L, solver,
-                  title=None,
-                  save=None,
-                  show_links=True,
-                  show_arrows=True,
-                  boundary=None,             # None | path JSON | shapely.Polygon
-                  show_dimensions=True,
-                  dim_offset_R=1.4,
-                  flip_vertical=True,
-                  fs_dim=12, fs_group=16, fs_arrow=13,  # font più grandi di default
-                  dpi=260):
-    import numpy as np
-    import matplotlib.colors as mcolors
-    from matplotlib.patches import Circle
-    from shapely.geometry import Polygon
-    from shapely.affinity import scale as shp_scale
-    from pathlib import Path
-    import matplotlib.pyplot as plt
-    import circle_packing as cp
-
-    palette = list(mcolors.TABLEAU_COLORS.values())
-    def color_for_group(k): return palette[k % len(palette)]
-
-    coords = np.asarray(coords, float)
-    N = len(coords)
-
-    # ---- boundary (in mm) ----
-    poly = None
-    if boundary is not None:
-        if isinstance(boundary, (str, Path)):
-            poly, _prep, _meta = cp.load_boundary(Path(boundary),
-                                                  to_units="mm",
-                                                  require_scale=False,
-                                                  flip_y=True)
-        elif isinstance(boundary, Polygon):
-            poly = boundary
-        else:
-            raise TypeError("boundary deve essere None, un path JSON o un shapely.Polygon")
-
-    # ---- bbox per eventuale flip ----
-    xmin = coords[:,0].min(); xmax = coords[:,0].max()
-    ymin = coords[:,1].min(); ymax = coords[:,1].max()
-    if poly is not None:
-        bxmin, bymin, bxmax, bymax = poly.bounds
-        xmin, xmax = min(xmin, bxmin), max(xmax, bxmax)
-        ymin, ymax = min(ymin, bymin), max(ymax, bymax)
-    cx, cy = (xmin + xmax) / 2.0, (ymin + ymax) / 2.0
-
-    # ---- coordinate di display (flip opzionale) ----
-    coords_disp = coords.copy()
-    poly_disp = poly
-    if flip_vertical:
-        coords_disp[:,1] = 2*cy - coords_disp[:,1]
-        if poly is not None:
-            poly_disp = shp_scale(poly, xfact=1.0, yfact=-1.0, origin=(cx, cy))
-
-    # ---- assegnazioni + “cella più centrale” per ogni gruppo ----
-    assigned_group = [-1]*N
-    for i in range(N):
-        for k in range(S):
-            if solver.BooleanValue(x[(i,k)]):
-                assigned_group[i] = k
-                break
-
-    centroids = np.full((S,2), np.nan)
-    label_pos = np.full((S,2), np.nan)   # centro della cella su cui scrivere il numero
-    label_idx = [-1]*S
-    for k in range(S):
-        idx = [i for i in range(N) if assigned_group[i] == k]
-        if not idx:
-            continue
-        pts = coords_disp[idx]
-        c = pts.mean(axis=0)
-        centroids[k] = c
-        j = idx[np.argmin(((pts[:,0]-c[0])**2 + (pts[:,1]-c[1])**2))]
-        label_pos[k] = coords_disp[j]
-        label_idx[k] = j
-
-    # ---- figura ----
-    fig, ax = plt.subplots(figsize=(12, 4.3), dpi=dpi)
-
-    # 1) contorno
-    if poly_disp is not None:
-        xB, yB = poly_disp.exterior.xy
-        ax.plot(xB, yB, color="black", lw=2.0, zorder=5)
-
-    # 2) celle
-    for i, (x0, y0) in enumerate(coords_disp):
-        gid = assigned_group[i]
-        fc = color_for_group(gid) if gid >= 0 else "white"
-        ax.add_patch(Circle((x0, y0), R, facecolor=fc,
-                            edgecolor="black", linewidth=0.8, zorder=10))
-
-    # 3) link sottili fra gruppi adiacenti (opzionale)
-    if show_links:
-        for k in range(S-1):
-            for (i, j) in E:
-                if solver.BooleanValue(z1[(k,i,j)]) or solver.BooleanValue(z2[(k,i,j)]):
-                    xi, yi = coords_disp[i]; xj, yj = coords_disp[j]
-                    ax.plot([xi, xj], [yi, yj], lw=1.1, alpha=0.50, color="black", zorder=12)
-
-    # 4) frecce TRA LE CELLE ETICHETTATE (niente testo, niente “(6)”)
-    if show_arrows:
-        for k in range(S-1):
-            x0, y0 = label_pos[k]
-            x1, y1 = label_pos[k+1]
-            if not (np.isnan(x0) or np.isnan(x1)):
-                ax.annotate("",
-                            xy=(x1, y1), xytext=(x0, y0),
-                            arrowprops=dict(arrowstyle="->",
-                                            linewidth=1.8, color="black",
-                                            shrinkA=R*0.35, shrinkB=R*0.35),
-                            zorder=18)
-
-    # 5) NUMERO DEL GRUPPO — rettangolo nero smussato, semi-trasp., testo bianco bold
-    for k in range(S):
-        px, py = label_pos[k]
-        if not (np.isnan(px) or np.isnan(py)):
-            ax.text(px, py, f"{k}",
-                    ha="center", va="center",
-                    fontsize=fs_group, color="white", fontweight="bold",
-                    bbox=dict(boxstyle="round,pad=0.22,rounding_size=0.18",
-                              fc=(0,0,0,0.70), ec="black", lw=0.9),
-                    zorder=19)
-
-    # 6) quote in mm
-    if poly_disp is not None and show_dimensions:
-        _edge_labels(ax, poly_disp, offset_mm=float(dim_offset_R)*float(R),
-                     fontsize=fs_dim)
-
-    # 7) layout pulito
-    xs, ys = coords_disp[:,0], coords_disp[:,1]
-    xmin_p, xmax_p = xs.min()-2*R, xs.max()+2*R
-    ymin_p, ymax_p = ys.min()-2*R, ys.max()+2*R
-    if poly_disp is not None:
-        bxmin, bymin, bxmax, bymax = poly_disp.bounds
-        xmin_p, ymin_p = min(xmin_p, bxmin), min(ymin_p, bymin)
-        xmax_p, ymax_p = max(xmax_p, bxmax), max(ymax_p, bymax)
-
-    ax.set_xlim(xmin_p, xmax_p)
-    ax.set_ylim(ymin_p, ymax_p)
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xticks([]); ax.set_yticks([])
-    for sp in ax.spines.values():
-        sp.set_visible(False)
-
-    if title:  # per default è None → nessun titolo
-        ax.set_title(title, fontsize=fs_group, pad=6)
-
-    plt.tight_layout()
-    if save:
-        plt.savefig(save, bbox_inches="tight", dpi=300)
     plt.show()
 
 

@@ -34,63 +34,247 @@ import pyswarms as ps
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon as MplPolygon
 from time import perf_counter
+from shapely.geometry import Polygon, LineString, MultiPoint
+from shapely.prepared import prep
+from shapely.ops import unary_union, polygonize, linemerge, snap
+from shapely.affinity import scale as shp_scale, translate as shp_translate
+import pandas as pd
 
 
-R = 9.0  # mm, radius of an 18650 seen from the top
+R_DEFAULT = 9.0  # mm, radius of an 18650 seen from the top
+
+
+
+def plot_numbered_circles(centres,
+                          r=9.0,
+                          title="",
+                          edgecolor="k",
+                          linewidth=1.2,
+                          number_color="k",
+                          start_index=1,
+                          facecolor="none",
+                          dpi=120):
+    """
+    Disegna solo cerchi (raggio fisso) e numeri al centro, nell'ordine dei punti.
+    
+    Parametri
+    ---------
+    centres : array-like (N, 2)
+        Coordinate (x, y) dei centri, nell'ordine del CSV.
+    r : float
+        Raggio dei cerchi (stessa unità delle coordinate).
+    title : str
+        Titolo opzionale.
+    edgecolor : str
+        Colore del bordo dei cerchi.
+    linewidth : float
+        Spessore del bordo dei cerchi.
+    number_color : str
+        Colore del numero scritto dentro il cerchio.
+    start_index : int
+        Numero da cui iniziare la numerazione (1 per numerazione umana).
+    facecolor : str
+        Colore di riempimento dei cerchi. Usa "none" per cerchi vuoti.
+    dpi : int
+        DPI della figura (per nitidezza del testo).
+    """
+    centres = np.asarray(centres, dtype=float)
+    if centres.ndim != 2 or centres.shape[1] != 2:
+        raise ValueError("centres deve essere un array Nx2 di coordinate (x, y).")
+
+    # Figura e assi
+    fig, ax = plt.subplots(figsize=(6, 6), dpi=dpi)
+
+    # Disegna cerchi e numeri
+    for i, (x, y) in enumerate(centres):
+        circ = plt.Circle((x, y), r, facecolor=facecolor,
+                          edgecolor=edgecolor, lw=linewidth, zorder=2)
+        ax.add_patch(circ)
+
+        # Font size proporzionale al raggio (fallback 8)
+        fs = max(8, 0.6 * r)
+        ax.text(x, y, str(i + start_index),
+                ha="center", va="center",
+                fontsize=fs, color=number_color,
+                zorder=3)
+
+    # Limiti con un piccolo margine
+    xmin = centres[:,0].min() - r*1.2
+    xmax = centres[:,0].max() + r*1.2
+    ymin = centres[:,1].min() - r*1.2
+    ymax = centres[:,1].max() + r*1.2
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.axis("off")
+    if title:
+        ax.set_title(title)
+    plt.tight_layout()
+    plt.show()
+
 
 
 ##############################################################################
 # ------------- 0. Parse command-line & input JSON --------------------------
 ##############################################################################
 
-def _detect_scale_cm_per_px(disegno: dict):
-    """
-    Ritorna il fattore cm/px se presente o ricavabile, altrimenti None.
-    Priorità:
-      1) disegno["scale_cm_per_px"]
-      2) mediana di (misure_cm[i] / misure_px[i]) se entrambe presenti
-    """
-    s = disegno.get("scale_cm_per_px", None)
-    if isinstance(s, (int, float)) and s > 0:
-        return float(s)
+def _parse_vertici_px(disegno):
+    V = disegno.get("vertici")
+    pts = []
+    if isinstance(V, list):
+        for v in V:
+            if isinstance(v, dict) and "x" in v and "y" in v:
+                try:
+                    pts.append((float(v["x"]), float(v["y"])))
+                except Exception:
+                    pass
+            elif isinstance(v, (list, tuple)) and len(v) >= 2:
+                try:
+                    pts.append((float(v[0]), float(v[1])))
+                except Exception:
+                    pass
+    return pts if len(pts) >= 3 else None
 
-    cm = disegno.get("misure_cm")
-    px = disegno.get("misure_px")
-    if isinstance(cm, list) and isinstance(px, list) and len(cm) == len(px) and len(px) > 0:
-        pairs = [(float(c), float(p)) for c, p in zip(cm, px) if p and float(p) > 0]
+def _poly_from_lines_px(disegno: dict):
+    lines = disegno.get("lines") or []
+    segs = []
+    for L in lines:
+        try:
+            x1 = float(L["x1"]); y1 = float(L["y1"])
+            x2 = float(L["x2"]); y2 = float(L["y2"])
+            segs.append(LineString([(x1, y1), (x2, y2)]))
+        except Exception:
+            continue
+    if not segs:
+        return None
+
+    # Unisci, "snappa" piccoli gap, polygonizza e prendi il poligono più grande
+    ml = unary_union(segs)                 # MultiLineString
+    ml = linemerge(ml)
+    ml = snap(ml, ml, 1e-6)               # chiude micro-gap (in px)
+    polys = list(polygonize(ml))
+    if not polys:
+        return None
+    return max(polys, key=lambda p: p.area)
+
+def _poly_from_vertices_px(disegno: dict):
+    verts = disegno.get("vertici") or []
+    pts = []
+    for v in verts:
+        try:
+            pts.append((float(v["x"]), float(v["y"])))
+        except Exception:
+            pass
+    if len(pts) < 3:
+        return None
+    # ordina attorno al baricentro (robusto abbastanza per disegni “normali”)
+    cx = sum(x for x, _ in pts) / len(pts)
+    cy = sum(y for _, y in pts) / len(pts)
+    pts.sort(key=lambda p: math.atan2(p[1]-cy, p[0]-cx))
+    poly = Polygon(pts)
+    if poly.is_valid and not poly.is_empty:
+        return poly
+    # ultimo fallback: hull
+    return MultiPoint(pts).convex_hull
+
+
+def _detect_scale_px(disegno: dict):
+    """
+    Rileva i fattori di conversione px→mm e px→cm.
+    Priorità:
+      1) scale_mm_per_px (mm/px)   → px_to_mm
+      2) scale_cm_per_px (cm/px)   → px_to_cm
+      3) median(misure_mm / misure_px)
+      4) median(misure_cm / misure_px)
+    Ritorna: (px_to_mm, px_to_cm) oppure (None, None) se non ricavabile.
+    """
+    def _to_float_list(seq):
+        out = []
+        for v in (seq or []):
+            try:
+                out.append(float(v))
+            except Exception:
+                pass
+        return out
+
+    # 1) scala esplicita mm/px
+    s_mm = disegno.get("scale_mm_per_px", None)
+    try:
+        s_mm = float(s_mm) if s_mm is not None else None
+    except Exception:
+        s_mm = None
+    if s_mm and s_mm > 0:
+        return float(s_mm), float(s_mm) / 10.0  # px→mm, px→cm
+
+    # 2) scala esplicita cm/px
+    s_cm = disegno.get("scale_cm_per_px", None)
+    try:
+        s_cm = float(s_cm) if s_cm is not None else None
+    except Exception:
+        s_cm = None
+    if s_cm and s_cm > 0:
+        return float(s_cm) * 10.0, float(s_cm)
+
+    # 3) misure_mm / misure_px
+    mm = _to_float_list(disegno.get("misure_mm"))
+    px = _to_float_list(disegno.get("misure_px"))
+    if mm and px and len(mm) == len(px):
+        pairs = [(m, p) for m, p in zip(mm, px) if p and float(p) > 0]
+        if pairs:
+            ratios = [m/p for m, p in pairs]  # mm/px
+            med = float(np.median(ratios))
+            return med, med / 10.0
+
+    # 4) misure_cm / misure_px
+    cm = _to_float_list(disegno.get("misure_cm"))
+    px = _to_float_list(disegno.get("misure_px"))
+    if cm and px and len(cm) == len(px):
+        pairs = [(c, p) for c, p in zip(cm, px) if p and float(p) > 0]
         if pairs:
             ratios = [c/p for c, p in pairs]  # cm/px
-            return float(np.median(ratios))
+            med = float(np.median(ratios))
+            return med * 10.0, med
 
-    # JSON vecchio → nessuna scala esplicita
-    return None
+    return None, None
 
-def load_boundary(json_path, to_units="mm", require_scale=False):
+
+def load_boundary(json_path, to_units="mm", require_scale=False, flip_y=True):
     """
-    Carica il poligono dal JSON e converte le coordinate da pixel alle unità desiderate.
-    - to_units: "mm" (default) | "cm" | "m"
-    - require_scale: se True e non c'è scala → solleva ValueError; se False → usa px come mm.
-
-    Ritorna: (poly_in_units, prepared_poly, meta_dict)
-      meta_dict contiene: {"px_to_mm":..., "px_to_cm":..., "scale_cm_per_px":...}
+    Ricostruisce il contorno in modo robusto (indipendente dall'ordine di disegno):
+      1) prova con 'lines' -> polygonize
+      2) se fallisce, usa 'vertici' riordinati (CCW)
+      3) altrimenti hull
+    Converte poi in 'mm' (default), 'cm' o 'm'.
+    Se flip_y=True, converte dal sistema 'schermo' (Y↓) a cartesiano (Y↑).
+    Ritorna: (poly_in_units, prepared_poly, meta)
     """
-    data = json.loads(open(json_path, "r").read())
+    data = json.loads(open(json_path, "r", encoding="utf-8").read())
     disegno = json.loads(data["disegnoJson"])["disegno"]
 
-    verts_px = [(float(v["x"]), float(v["y"])) for v in disegno["vertici"]]
-    s_cm_per_px = _detect_scale_cm_per_px(disegno)
-
-    if s_cm_per_px is None:
+    # fattori px→unità
+    px_to_mm, px_to_cm = _detect_scale_px(disegno)
+    if px_to_mm is None or px_to_cm is None:
         if require_scale:
-            raise ValueError("Scala assente nel JSON (né scale_cm_per_px né misure_cm/misure_px).")
-        # fallback retro-compatibile: considera 1 px ≈ 1 mm
-        px_to_mm = 1.0
-        px_to_cm = 0.1
-    else:
-        px_to_cm = s_cm_per_px
-        px_to_mm = s_cm_per_px * 10.0
+            raise ValueError("Scala assente: né scale_mm_per_px/scale_cm_per_px né misure_mm/cm con misure_px.")
+        px_to_mm, px_to_cm = 1.0, 0.1  # fallback
 
-    # conversione
+    # 1) preferisci sempre le 'lines' (poligono "bordo sottile")
+    poly_px = _poly_from_lines_px(disegno)
+    # 2) fallback ai 'vertici'
+    if poly_px is None:
+        poly_px = _poly_from_vertices_px(disegno)
+    if poly_px is None or poly_px.is_empty:
+        raise ValueError("Impossibile ricostruire il perimetro dal JSON (né lines né vertici utili).")
+
+    # ── Flip Y (schermo→cartesiano) prima della scalatura ──────────────────
+    if flip_y:
+        minx, miny, maxx, maxy = poly_px.bounds
+        # riflette rispetto all'orizzontale e riporta nell'intervallo [miny, maxy]
+        poly_px = shp_scale(poly_px, xfact=1.0, yfact=-1.0, origin=(0, 0))
+        poly_px = shp_translate(poly_px, xoff=0.0, yoff=(maxy + miny))
+
+    # conversione unità
     if to_units == "mm":
         factor = px_to_mm
     elif to_units == "cm":
@@ -100,17 +284,18 @@ def load_boundary(json_path, to_units="mm", require_scale=False):
     else:
         raise ValueError("to_units deve essere 'mm', 'cm' o 'm'.")
 
-    verts = [(x*factor, y*factor) for (x, y) in verts_px]
+    poly = shp_scale(poly_px, xfact=factor, yfact=factor, origin=(0, 0)).buffer(0)
 
-    poly = Polygon(verts).buffer(0)
-    if not poly.is_valid:
-        raise ValueError("Boundary polygon is invalid")
+    if not poly.is_valid or poly.is_empty:
+        raise ValueError("Boundary polygon is invalid after conversion.")
 
     meta = {
-        "scale_cm_per_px": s_cm_per_px,
-        "px_to_cm": px_to_cm,
+        "scale_mm_per_px": px_to_mm,   # mm/px
+        "scale_cm_per_px": px_to_cm,   # cm/px
         "px_to_mm": px_to_mm,
+        "px_to_cm": px_to_cm,
         "units": to_units,
+        "y_flipped": bool(flip_y),
     }
     return poly, prep(poly), meta
 
@@ -312,7 +497,7 @@ def plot_phase(poly, centres, added_idx=None, title="",
 # ------------- 2. Hexagonal grid seeding -----------------------------------
 ##############################################################################
 
-DX, DY = 2*R, math.sqrt(3)*R          # hex lattice periods
+#X, DY = 2*R, math.sqrt(3)*R          # hex lattice periods
 
 def longest_edge_angle(poly: Polygon) -> float:
     """Return angle (radians) of the longest edge of the polygon."""
@@ -324,14 +509,15 @@ def longest_edge_angle(poly: Polygon) -> float:
                                                     e[1][1]-e[0][1]))
     return math.atan2(y2-y1, x2-x1)     # radians
 
-def _hex_grid_in_rot(rot_poly, prep_rot, off_x, off_y, r=R):
-    """Return centres inside rot_poly for one particular phase shift."""
+def _hex_grid_in_rot(rot_poly, prep_rot, off_x, off_y, r):
+    DX = 2.0 * r
+    DY = math.sqrt(3.0) * r
     minx, miny, maxx, maxy = rot_poly.bounds
     centres = []
     y = miny + off_y
     row = 0
     while y <= maxy:
-        x = minx + ((row % 2)*r) + off_x
+        x = minx + ((row % 2) * r) + off_x
         while x <= maxx:
             pt = Point(x, y)
             if prep_rot.contains(pt) and rot_poly.exterior.distance(pt) >= r:
@@ -341,19 +527,15 @@ def _hex_grid_in_rot(rot_poly, prep_rot, off_x, off_y, r=R):
         row += 1
     return np.asarray(centres, float)
 
-def oriented_hex_seed(poly: Polygon, r=R, n_phase=8):
-    """
-    1) rotate polygon so its longest edge is horizontal
-    2) try n_phase×n_phase phase shifts (off_x, off_y) in [0,DX)×[0,DY/2)
-    3) keep the densest seed, then rotate centres back
-    """
-    ang = longest_edge_angle(poly)                # radians
-    rot_poly  = rotate(poly, -math.degrees(ang), origin='centroid')
-    prep_rot  = prep(rot_poly)
+def oriented_hex_seed(poly: Polygon, r, n_phase=8):
+    ang = longest_edge_angle(poly)
+    rot_poly = rotate(poly, -math.degrees(ang), origin='centroid')
+    prep_rot = prep(rot_poly)
 
-    # sample offsets over one period (DY/2 because rows are staggered)
-    phase_x = np.linspace(-DX, DX,  2*n_phase, endpoint=False)
-    phase_y = np.linspace(-DY/2, DY/2, 2*n_phase, endpoint=False)
+    DX = 2.0 * r
+    DY = math.sqrt(3.0) * r
+    phase_x = np.linspace(-DX, DX, 2*n_phase, endpoint=False)
+    phase_y = np.linspace(-DY/2.0, DY/2.0, 2*n_phase, endpoint=False)
 
     best, best_cnt = None, -1
     for ox in phase_x:
@@ -362,32 +544,25 @@ def oriented_hex_seed(poly: Polygon, r=R, n_phase=8):
             if C.shape[0] > best_cnt:
                 best, best_cnt = C, C.shape[0]
 
-    # rotate centres back to the original frame
     cx, cy = poly.centroid.xy[0][0], poly.centroid.xy[1][0]
     c, s = math.cos(ang), math.sin(ang)
-    rot_mat = np.array([[c, -s],
-                        [s,  c]])
+    rot_mat = np.array([[c, -s],[s, c]])
     centres_orig = ((best - [cx, cy]) @ rot_mat.T) + [cx, cy]
     return centres_orig
 
 
 
 
-def best_hex_seed_two_angles(poly, n_phase=16):
-    """Try the default orientation and a +30° rotated one, keep denser."""
-    # --- 1  longest-edge orientation (what you already have)
-    base = oriented_hex_seed(poly, n_phase=n_phase)
+def best_hex_seed_two_angles(poly, r, n_phase=16):
+    base = oriented_hex_seed(poly, r, n_phase=n_phase)
 
-    # --- 2  +30° rotated outline ----------------------------------------
     ang_deg = 30.0
-    poly_rot = rotate(poly, ang_deg, origin='centroid')     # shapely rotate
-    alt_rot  = oriented_hex_seed(poly_rot, n_phase=n_phase) # build grid there
+    poly_rot = rotate(poly, ang_deg, origin='centroid')
+    alt_rot  = oriented_hex_seed(poly_rot, r, n_phase=n_phase)
 
-    # rotate the centres *back* by −30° (plain math, not shapely)
     theta = math.radians(-ang_deg)
     c, s  = math.cos(theta), math.sin(theta)
-    rotM  = np.array([[c, -s],
-                      [s,  c]])
+    rotM  = np.array([[c, -s],[s, c]])
     cx, cy = poly.centroid.xy[0][0], poly.centroid.xy[1][0]
     alt = ((alt_rot - [cx, cy]) @ rotM.T) + [cx, cy]
 
@@ -456,71 +631,49 @@ def batch_bfgs_compact(centres, r, poly, n_pass=5):
 # --------------------------------------------------------------------
 # Greedy random insertion of additional circles
 # --------------------------------------------------------------------
-def greedy_insert(poly, centres, trials=1000, max_pass=6):
-    """
-    Adds extra circles by random sampling strictly INSIDE `poly`.
-    Continues until one complete pass fails to add a circle, or
-    `max_pass` passes have been performed.
-    """
+def greedy_insert(poly, centres, r, trials=1000, max_pass=6):
     ppoly = prep(poly)
-    pts   = list(map(tuple, centres))           # mutable working list
+    pts = list(map(tuple, centres))
     minx, miny, maxx, maxy = poly.bounds
-
     for _ in range(max_pass):
         added_this_pass = 0
-
         for _ in range(trials):
-            # -- 1. rejection sample an interior point ------------------
-            for __ in range(60):                # ≤ 60 attempts
+            for __ in range(60):
                 x = random.uniform(minx, maxx)
                 y = random.uniform(miny, maxy)
                 if ppoly.contains(Point(x, y)):
-                    break                       # got an interior point
+                    break
             else:
-                continue                        # 60 failures → new trial
-
-            # -- 2. clearance checks -----------------------------------
-            d_cells = min(np.hypot(x-nx, y-ny) for nx, ny in pts)
+                continue
+            d_cells = min(np.hypot(x-nx, y-ny) for nx, ny in pts) if pts else 1e9
             d_wall  = poly.exterior.distance(Point(x, y))
-
-            if d_cells >= 2*R and d_wall >= R:  # fits!
+            if d_cells >= 2*r and d_wall >= r:
                 pts.append((x, y))
                 added_this_pass += 1
-
-        if added_this_pass == 0:                # nothing added → done
+        if added_this_pass == 0:
             break
-
     return np.asarray(pts, float)
 
-def skeleton_insert(poly, centres, r=R, step=2.0):
-    """
-    Walk the medial axis (approx.) of the residual space and
-    drop disks wherever there is 2R clearance.
-    """
-    # 1. residual pocket
-    free     = poly.buffer(-r).buffer(0)
-    hull     = unary_union([Point(x, y).buffer(r) for x, y in centres])
-    pocket   = free.difference(hull)
-    if pocket.is_empty:
-        return centres                        # already saturated
 
-    # 2. sample regularly on the pocket’s bounding box
+def skeleton_insert(poly, centres, r, step=2.0):
+    free   = poly.buffer(-r).buffer(0)
+    hull   = unary_union([Point(x, y).buffer(r) for x, y in centres])
+    pocket = free.difference(hull)
+    if pocket.is_empty:
+        return centres
     minx, miny, maxx, maxy = pocket.bounds
     grid_x = np.arange(minx, maxx + step, step)
     grid_y = np.arange(miny, maxy + step, step)
-
-    pts     = list(map(tuple, centres))
-    ppoly   = prep(poly)
-
+    pts   = list(map(tuple, centres))
+    ppoly = prep(poly)
     for y in grid_y:
         for x in grid_x:
             if not ppoly.contains(Point(x, y)):
                 continue
-            d_cells = min(np.hypot(x-nx, y-ny) for nx, ny in pts)
+            d_cells = min(np.hypot(x-nx, y-ny) for nx, ny in pts) if pts else 1e9
             d_wall  = poly.exterior.distance(Point(x, y))
             if d_cells >= 2*r and d_wall >= r:
                 pts.append((x, y))
-
     return np.asarray(pts, float)
 
 def largest_empty_circle(pocket):
@@ -561,7 +714,7 @@ def main(json_file: str, out_csv="centres.csv"):
     centres = best_hex_seed_two_angles(poly, n_phase=16)
     t1 = perf_counter()
     plot_phase(poly, centres, added_idx=np.arange(len(centres)),
-            title="After hex grid", r=R, time_s=t1 - t0)
+            title="After hex grid", r=R_DEFAULT, time_s=t1 - t0)
 
     # 2) First greedy
     prev = len(centres)
@@ -569,14 +722,14 @@ def main(json_file: str, out_csv="centres.csv"):
     centres = greedy_insert(poly, centres, trials=1000, max_pass=6)
     t1 = perf_counter()
     plot_phase(poly, centres, added_idx=np.arange(prev, len(centres)),
-            title="After first greedy", r=R, time_s=t1 - t0)
+            title="After first greedy", r=R_DEFAULT, time_s=t1 - t0)
 
     # 3) Local compaction (no new cells)
     t0 = perf_counter()
-    centres = batch_bfgs_compact(centres, R, poly, n_pass=4)
+    centres = batch_bfgs_compact(centres, R_DEFAULT, poly, n_pass=4)
     t1 = perf_counter()
     plot_phase(poly, centres, added_idx=[],
-            title="After compaction", r=R, time_s=t1 - t0)
+            title="After compaction", r=R_DEFAULT, time_s=t1 - t0)
 
     # 4) Second greedy
     prev = len(centres)
@@ -584,7 +737,7 @@ def main(json_file: str, out_csv="centres.csv"):
     centres = greedy_insert(poly, centres, trials=500, max_pass=3)
     t1 = perf_counter()
     plot_phase(poly, centres, added_idx=np.arange(prev, len(centres)),
-            title="After second greedy", r=R, time_s=t1 - t0)
+            title="After second greedy", r=R_DEFAULT, time_s=t1 - t0)
 
     # 5) Skeleton insert
     prev = len(centres)
@@ -592,15 +745,15 @@ def main(json_file: str, out_csv="centres.csv"):
     centres = skeleton_insert(poly, centres, step=2.0)
     t1 = perf_counter()
     plot_phase(poly, centres, added_idx=np.arange(prev, len(centres)),
-            title="After skeleton insert", r=R, time_s=t1 - t0)
+            title="After skeleton insert", r=R_DEFAULT, time_s=t1 - t0)
 
     # Optional: Save final CSV
     np.savetxt(out_csv, centres, delimiter=",", header="x,y", comments="")
     print(f"Saved {centres.shape[0]} circle centres to {out_csv}")
 
     # ───▶  DIAGNOSTIC POCKET ANALYSIS  ◀─────────────────────────────────────
-    free     = poly.buffer(-R).buffer(0)            # safe interior strip
-    hull     = unary_union([Point(x, y).buffer(R) for x, y in centres])
+    free     = poly.buffer(-R_DEFAULT).buffer(0)            # safe interior strip
+    hull     = unary_union([Point(x, y).buffer(R_DEFAULT) for x, y in centres])
     residual = free.difference(hull)
 
     print(f"Area that could still host a centre: {residual.area:.1f} mm²")
