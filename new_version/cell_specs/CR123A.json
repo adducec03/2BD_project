@@ -1,0 +1,9 @@
+{
+  "type": "CR123A",
+  "diameter_mm": 17.0,
+  "height_mm": 34.5,
+  "nominal_voltage_V": 3,
+  "capacity_min_mAh": 1500,
+  "capacity_max_mAh": 2100,
+  "capacity_step_mAh": 100
+}

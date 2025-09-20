@@ -1,0 +1,9 @@
+{
+  "type": "26650",
+  "diameter_mm": 18.0,
+  "height_mm": 65.0,
+  "nominal_voltage_V": 3.7,
+  "capacity_min_mAh": 2500,
+  "capacity_max_mAh": 6000,
+  "capacity_step_mAh": 100
+}

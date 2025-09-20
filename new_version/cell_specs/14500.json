@@ -1,0 +1,9 @@
+{
+  "type": "14500",
+  "diameter_mm": 14.0,
+  "height_mm": 50.0,
+  "nominal_voltage_V": 3.7,
+  "capacity_min_mAh": 600,
+  "capacity_max_mAh": 1000,
+  "capacity_step_mAh": 100
+}
